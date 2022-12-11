@@ -13,7 +13,7 @@ def get_config(conf_file):
     return conf
 
 
-def autogroupchat_test_pubsub(event, context):
+def autogroupchat_pubsub(event, context):
     """Triggered from a message on a Cloud Pub/Sub topic.
     Args:
          event (dict): Event payload.
@@ -24,7 +24,7 @@ def autogroupchat_test_pubsub(event, context):
     config = get_config("config_googlesheets_groupme.json")
 
     log_level = logging.INFO
-    if verbose:
+    if config['verbose']:
         log_level = logging.DEBUG
     logging.basicConfig(level=log_level, format=f'[{log_level}] %(message)s')
     logger = logging.getLogger(__name__)
