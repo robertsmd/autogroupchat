@@ -73,6 +73,9 @@ class AutoScrapeGroup:
             group_metadata['members'] = members
             logger.info("group_metadata = " +
                         json.dumps(group_metadata, indent=4))
+            logger.info(
+                f"Calling {clazz}.group_startup for group named {group_metadata['group_name']}")
+            logger.debug(f"group_metadata={group_metadata}")
             clazz.group_startup(clazz,
                                 cls_config_file,
                                 group_metadata['group_name'],
@@ -102,9 +105,19 @@ class AutoScrapeGroup:
             except ValueError:
                 return
 
+            # if it is not already passed
+            if date.date() < datetime.date.today():
+                logger.debug(
+                    f"Column for date {date} is already passed, not creating group.")
+                pass
             # if it is scheduled for today
-            if (date.date() - datetime.date.today()) < datetime.timedelta(days=1):
+            elif (date.date() - datetime.date.today()) < datetime.timedelta(days=1):
+                logger.info(
+                    f"Column for date {date} is today, creating group.")
                 self.groups_to_create.append(column)
+            else:
+                logger.debug(
+                    f"Column for date {date} is not today, waiting on creating group.")
 
     def get_keyvalue_info(self, col_num):
         assert self.df[col_num][0].lower() == "key" and \
