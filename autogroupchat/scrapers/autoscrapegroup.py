@@ -1,0 +1,133 @@
+import json
+import os.path
+import logging
+import argparse
+import datetime
+import pandas as pd
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+from autogroupchat.makers.automakegroupme import AutoMakeGroupMe
+
+# If modifying these scopes, delete the file token.json.
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+
+global logger
+logger = logging.getLogger(__name__)
+
+
+class AutoScrapeGroup:
+    def __init__(self, spreadsheet, spreadsheet_range, api_config, token_config=None, scopes=SCOPES, *args, **kwargs):
+        self.spreadsheet = spreadsheet
+        self.spreadsheet_range = spreadsheet_range
+        self.api_config_file = api_config
+        self.token_config_file = token_config
+        self.scopes = scopes
+
+        if not self.token_config_file:
+            filename, ext = api_config_file.split(os.path.extsep)
+            self.token_config_file = f"{filename}_token{os.path.extsep}{ext}"
+
+        self.args = args
+        self.auth()
+        self.df = self.get_df()
+
+        self.info = {}
+        self.groups_to_create = []
+        self.contacts = {}
+
+        self.process_df()
+
+    def auth(self):
+        raise NotImplementedError
+
+    def get_df(self):
+        raise NotImplementedError
+
+    def process_df(self):
+        for col in self.df:
+            self.process_column(col)
+
+    def create_groups(self, clazz, cls_config_file):
+        for group in self.groups_to_create:
+            group_metadata = self.info.copy()
+            date = group[0]
+            time = group[1]
+            group_metadata['group_name'] = group_metadata['group_name'].format(
+                date=date, time=time)
+
+            members = {}
+            # ignore the first two lines, they hold date and time respectively
+            for row in range(2, len(group)):
+                # if cell isn't empty, it's a mark that the person is included
+                if group[row]:
+                    member = self.contacts[row]
+                    # member is a dictionary, and we want to add it to members
+                    # so we use the update method to add/update.
+                    members.update(member)
+
+            group_metadata['members'] = members
+            logger.info("group_metadata = " +
+                        json.dumps(group_metadata, indent=4))
+            clazz.group_startup(clazz,
+                                cls_config_file,
+                                group_metadata['group_name'],
+                                group_metadata['members'],
+                                group_metadata.get('admin', {}),
+                                group_metadata.get('startup_messages', []),
+                                group_metadata.get('image', ''),
+                                group_metadata.get('description', ''),
+                                group_metadata.get('dont_leave_group', True)
+                                )
+
+    def process_column(self, col_num):
+        column = self.df[col_num]
+        if column[0].lower() == "key":
+            self.info = self.get_keyvalue_info(col_num)
+        elif column[0].lower() == "value":
+            # this is processed with key
+            pass
+        elif column[0].lower() == "name":
+            self.contacts = self.get_contacts(col_num)
+        elif column[0].lower() == "number":
+            # this is processed with name
+            pass
+        else:
+            try:
+                date = datetime.datetime.strptime(column[0], '%m/%d/%Y')
+            except ValueError:
+                return
+
+            # if it is scheduled for today
+            if (date.date() - datetime.date.today()) < datetime.timedelta(days=1):
+                self.groups_to_create.append(column)
+
+    def get_keyvalue_info(self, col_num):
+        assert self.df[col_num][0].lower() == "key" and \
+            self.df[col_num + 1][0].lower() == "value"
+
+        info = {}
+        keys = self.df[col_num]
+        values = self.df[col_num + 1]
+        for i in range(1, len(keys)):
+            if keys[i] and values[i]:
+                info[keys[i]] = values[i]
+        logger.info("info = " + json.dumps(info, indent=4))
+        return info
+
+    def get_contacts(self, col_num):
+        assert self.df[col_num][0].lower() == "name" and \
+            self.df[col_num + 1][0].lower() == "phone"
+
+        contacts = {}
+        names = self.df[col_num]
+        phones = self.df[col_num + 1]
+        for i in range(1, len(names)):
+            if names[i] and phones[i]:
+                contacts[i] = {names[i]: phones[i]}
+        logger.info("contacts = " + json.dumps(contacts, indent=4))
+        return contacts
