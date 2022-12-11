@@ -44,8 +44,11 @@ class AutoScrapeGoogleSheets(AutoScrapeGroup):
                     self.api_config_file, SCOPES)
                 self.creds = flow.run_local_server(port=0)
             # Save the credentials for the next run
-            with open(self.token_config_file, 'w') as token:
-                json.dump(self.creds.to_json(), token, indent=4)
+            try:
+                with open(self.token_config_file, 'w') as token:
+                    json.dump(self.creds.to_json(), token, indent=4)
+            except OSError:
+                logger.error(f"File {self.token_config_file} is not writable. Not writing token to disk.")
 
     def get_df(self):
         try:
