@@ -45,7 +45,7 @@ class AutoScrapeGoogleSheets(AutoScrapeGroup):
                 self.creds = flow.run_local_server(port=0)
             # Save the credentials for the next run
             with open(self.token_config_file, 'w') as token:
-                token.write(self.creds.to_json())
+                json.dump(self.creds.to_json(), token, indent=4)
 
     def get_df(self):
         try:

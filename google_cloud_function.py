@@ -6,10 +6,6 @@ from autogroupchat.scrapers.autoscrapegooglesheets import scrape_using_dict
 
 global logger
 
-log_level = logging.DEBUG
-logging.basicConfig(level=log_level, format=f'[{log_level}] %(message)s')
-logger = logging.getLogger(__name__)
-
 
 def get_config(conf_file):
     with open(conf_file) as f:
@@ -26,7 +22,16 @@ def autogroupchat_test_pubsub(event, context):
     pubsub_message = base64.b64decode(event['data']).decode('utf-8')
     print(pubsub_message)
     config = get_config("config_googlesheets_groupme.json")
+
+    log_level = logging.INFO
+    if verbose:
+        log_level = logging.DEBUG
+    logging.basicConfig(level=log_level, format=f'[{log_level}] %(message)s')
+    logger = logging.getLogger(__name__)
+
     scrape_using_dict(config)
 
+
 if __name__ == "__main__":
-    autogroupchat_test_pubsub({"data": "VGVzdGluZyBBdXRvR3JvdXBDaGF0Li4u"}, None)
+    autogroupchat_test_pubsub(
+        {"data": "VGVzdGluZyBBdXRvR3JvdXBDaGF0Li4u"}, None)
