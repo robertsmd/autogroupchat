@@ -1,6 +1,6 @@
 from setuptools import setup, find_packages
 
-VERSION = '0.0.1'
+VERSION = '0.1.0'
 DESCRIPTION = 'a package for automation of creation of GroupMe groups'
 LONG_DESCRIPTION = 'Scrape data from Google Sheets to get info on how to create groups, then create them using GroupMe API.'
 
