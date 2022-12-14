@@ -45,8 +45,8 @@ class AutoScrapeGoogleSheets(AutoScrapeGroup):
                 self.creds = flow.run_local_server(port=0)
             # Save the credentials for the next run
             try:
-                with open(self.token_config_file, 'w') as token:
-                    json.dump(self.creds.to_json(), token, indent=4)
+                with open(self.token_config_file, 'w') as f:
+                    json.dump(json.loads(self.creds.to_json()), f, indent=4)
             except OSError:
                 logger.error(f"File {self.token_config_file} is not writable. Not writing token to disk.")
 
@@ -106,12 +106,13 @@ def run(args):
 
 
 if __name__ == '__main__':
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
-    parser.add_argument("-g", "--api-config", default="../../config_googleapi.json",
+    parser.add_argument("-g", "--api-config", default=f"{os.path.dirname(__file__)}/../../config_googleapi.json",
                         help="json configuration file specifying credentials")
     parser.add_argument("-t", "--token-config",
-                        default="../../config_googleapi_token.json")
+                        default=f"{os.path.dirname(__file__)}/../../config_googleapi_token.json")
     parser.add_argument("spreadsheet")
     parser.add_argument("-r", "--range", default="Sheet1")
     parser.add_argument("-s", "--scopes", nargs="+",
@@ -119,7 +120,7 @@ if __name__ == '__main__':
     parser.add_argument("--group-creation-class",
                         default="AutoMakeGroupMe")
     parser.add_argument("--group-creation-config",
-                        default="../../config_groupme.json")
+                        default=f"{os.path.dirname(__file__)}/../../config_groupme.json")
     parser.set_defaults(func=run)
 
     args = parser.parse_args(["<spreadsheet_id>"])
