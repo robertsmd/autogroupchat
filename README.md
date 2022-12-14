@@ -67,15 +67,23 @@ The tutorial goes through these rough steps:
 2. Schedule a job with Google Cloud Scheduler
 
     2.1. Timing: schedule the job for daily at 7am using the cron line `0 7 * * *`)
+    
     2.2. Target: Pub/Sub. The topic prefix will be set based on the project, the sub-topic should be `test` or `prod` or something else based on your use case.
+    
     2.3. Advanced: optional retry settings
 
 3. Create a Google Cloud Function
+    
     3.1. Tab 1 - Trigger: Pub/Sub. The topic should be the same as in 2.2.
+    
     3.2. Tab 2 - Runtime: Pick the most recent Python version. Built initially using 3.10
+    
     3.3. Tab 2 - main.py: Copy all of [google_cloud_main.py](/google_cloud_main.py) into `main.py`
+    
     3.4. Tab 2 - requirements.txt: Copy all of [requirements.txt](/requirements.txt) into `requirements.txt`
+    
     3.5. Tab 2 - configs: copy all the config files from [configs_templates](/configs_templates) folder into [configs](/configs). Make sure there are no stubbed `<>` tags in the config files-- populate them with real data.
+    
     3.6. Tab 3 - configs: copy the files from the [configs](/configs) folder into the Cloud Function at the same level as `main.py`. (for google sheets --> groupme, should include configs: [config_googlesheets_groupme.json](/config_googlesheets_groupme.json), [config_googleapi_token.json.json](/config_googleapi_token.json.json), [config_googleapi.json](config_googleapi.json), and [config_groupme.json](config_groupme.json))
 
     ![Google Cloud Function source](/assets/images/google/google_cloud_function_source.png)
