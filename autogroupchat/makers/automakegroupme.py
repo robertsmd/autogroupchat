@@ -1,12 +1,11 @@
 import sys
-import json
+import os.path
 import logging
 import argparse
 import datetime
 
 from groupy.client import Client
 from groupy.api.groups import Group
-from groupy.api.memberships import MembershipRequest
 from groupy.exceptions import BadResponse
 
 from autogroupchat.makers.automakegroupchat import AutoMakeGroupChat, MESSAGE_ALWAYS_SEND
@@ -139,7 +138,7 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
-    parser.add_argument("-g", "--config-file", default="../../config_groupme.json",
+    parser.add_argument("-g", "--config-file", default=f"{os.path.dirname(__file__)}/../../configs/config_groupme.json",
                         help="json configuration file specifying credentials")
     parser.add_argument("group_name")
     parser.add_argument("members", nargs="+", help="members of the group")
