@@ -138,7 +138,7 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
-    parser.add_argument("-g", "--config-file", default=f"{os.path.dirname(__file__)}/../../config_groupme.json",
+    parser.add_argument("-g", "--config-file", default=f"{os.path.dirname(__file__)}/../../configs/config_groupme.json",
                         help="json configuration file specifying credentials")
     parser.add_argument("group_name")
     parser.add_argument("members", nargs="+", help="members of the group")
