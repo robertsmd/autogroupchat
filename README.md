@@ -33,20 +33,20 @@ Authentication is module specific, but is intended to be provided in a `json` co
 1. API access to GroupMe starts by going to https://dev.groupme.com.
 
 2. Click `login` in the top right corner, or go to https://dev.groupme.com/session/new and login with your username/email/phone number and password. This will require a 2FA PIN confirmation to your phone number on the account.
-![Login Screen!](/assets/images/groupme/groupme_login.jpg)
+![Login Screen!](/assets/images/groupme/groupme_login.png)
 
 
 
 3. Once logged in, you can see documentation of the HTTP REST API. Alternately, you can use a python wrapper. This module used `groupy` https://groupy.readthedocs.io/en/latest/pages/api.html.
 
 4. Click "Access Token" in the top right corner.
-![Home](/assets/images/groupme/groupme_logged_in.jpg)
+![Home](/assets/images/groupme/groupme_logged_in.png)
 
 5. Copy the access token *(WARNING: Don't share this. Someone with this token can act on your behalf on GroupMe.)*
-![Access Token](/assets/images/groupme/groupme_access_token.jpg)
+![Access Token](/assets/images/groupme/groupme_access_token.png)
 
 6. Paste the access token into `config_groupme.json`
-![Config File](/assets/images/groupme/groupme_config_file.jpg)
+![Config File](/assets/images/groupme/groupme_config_file.png)
 
 ### Cloud deployment
 
