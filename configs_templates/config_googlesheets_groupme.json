@@ -1,0 +1,12 @@
+{
+    "verbose": false,
+    "api_config": "config_googleapi.json",
+    "token_config": "config_googleapi_token.json",
+    "spreadsheet": "<spreadsheet_uuid>",
+    "range": "Sheet1",
+    "scopes": [
+        "https://www.googleapis.com/auth/spreadsheets.readonly"
+    ],
+    "group_creation_class": "AutoMakeGroupMe",
+    "group_creation_config": "config_groupme.json"
+}
