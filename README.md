@@ -66,7 +66,7 @@ The tutorial goes through these rough steps:
 1. Enable Google Cloud Platform (GCP)
 2. Schedule a job with Google Cloud Scheduler
 
-    2.1. Timing: schedule the job for daily at 7am using the cron line `0 7 * * *`)
+    2.1. Timing: schedule the job for daily at 7am using the cron line `0 7 * * *`or every sunday at 7am using the cron line `0 7 * * SUN`.
     
     2.2. Target: Pub/Sub. The topic prefix will be set based on the project, the sub-topic should be `test` or `prod` or something else based on your use case.
     
