@@ -1,42 +1,44 @@
 # autogroupchat
 
-## Usage
-
 Autogroupchat consists of two modular pieces: `scrapers` and `makers`. `Scrapers` are designed to get data from a spreadsheet online. The first scraper built was for Google Sheets. `Makers` are designed to create a group chat from the data scraped by the `scraper`. The first maker built was for GroupMe.
 
 Lastly, autogroupchat is meant to be able to deploy as a function on any cloud. Initially it was implemented on Google cloud.
 
-### Scrapers
+## Spreadsheet layout
 
-#### Subclassing
+**TODO**
+
+## Scrapers
+
+### Subclassing
 
 To implement a new scraper, subclass [AutoScrapeGroup](/autogroupchat/scrapers/autoscrapegroup.py)
 
-#### Authentication
+### Authentication
 
 Authentication is module specific, but is intended to be provided in a `json` config file starting with the prefix `config_`. For instance, `config_googleapi.json` is the default config file for the Google Sheets plugin.
 
-#### Scraper Modules
+### Scraper Modules
 
-##### [Google Sheets](/autogroupchat/scrapers/autoscrapegooglesheets.py)
+#### [Google Sheets](/autogroupchat/scrapers/autoscrapegooglesheets.py)
 
 Google sheets is based on the following Google tutorial: https://developers.google.com/sheets/api/quickstart/python
 
 In order to set up authentication, move the `credentials.json` described in the tutorial to `config_googleapi.json` in the root of this project. If using 0Auth, users must run the module in order to setup the 0Auth token. If a user runs `autogroupchat/scrapers/autoscrapegooglesheets.py`, it will prompt you to login and grant initial access. It will write (by default) the token to `config_googleapi_token.json`. This can be copied into the cloud and run without user interaction. **WARNING: be careful with any of the `config_*.json` files, they will provide at least API access to your account's resources.**
 
-### Makers
+## Makers
 
-#### Subclassing
+### Subclassing
 
 To implement a new maker, subclass [AutoMakeGroupChat](/autogroupchat/makers/automakegroupchat.py)
 
-#### Authentication
+### Authentication
 
 Authentication is module specific, but is intended to be provided in a `json` config file starting with the prefix `config_`. For instance, `config_groupme.json` is the default config file for the GroupMe plugin.
 
-#### Maker Modules
+### Maker Modules
 
-##### [GroupMe](/autogroupchat/makers/automakegroupme.py)
+#### [GroupMe](/autogroupchat/makers/automakegroupme.py)
 
 1. API access to GroupMe starts by going to https://dev.groupme.com.
 
@@ -56,9 +58,9 @@ Authentication is module specific, but is intended to be provided in a `json` co
 6. Paste the access token into `config_groupme.json`
 ![Config File](/assets/images/groupme/groupme_config_file.png)
 
-### Cloud deployment
+## Cloud deployment
 
-#### Google Cloud deployment
+### Google Cloud deployment
 
 Cloud deployment was initially done based on this tutorial: https://towardsdatascience.com/how-to-schedule-a-python-script-on-google-cloud-721e331a9590. Reference this tutorial if setting up autogroupchat for the first time.
 
@@ -84,7 +86,7 @@ The tutorial goes through these rough steps:
     
     3.5. Tab 2 - configs: copy all the config files from [configs_templates](/configs_templates) folder into [configs](/configs). Make sure there are no stubbed `<>` tags in the config files-- populate them with real data.
     
-    3.6. Tab 3 - configs: copy the files from the [configs](/configs) folder into the Cloud Function at the same level as `main.py`. (for google sheets --> groupme, should include configs: [config_googlesheets_groupme.json](/config_googlesheets_groupme.json), [config_googleapi_token.json.json](/config_googleapi_token.json.json), [config_googleapi.json](config_googleapi.json), and [config_groupme.json](config_groupme.json))
+    3.6. Tab 3 - configs: copy the files from the [configs](/configs) folder into the Cloud Function at the same level as `main.py`. (for google sheets --> groupme, your project should look like the screenshot below and should include configs: [config_googlesheets_groupme.json](/config_googlesheets_groupme.json), [config_googleapi_token.json.json](/config_googleapi_token.json.json), [config_googleapi.json](config_googleapi.json), and [config_groupme.json](config_groupme.json))
 
     ![Google Cloud Function source](/assets/images/google/google_cloud_function_source.png)
 
