@@ -84,7 +84,8 @@ class AutoScrapeGroup:
                                 group_metadata.get('startup_messages', []),
                                 group_metadata.get('image', ''),
                                 group_metadata.get('description', ''),
-                                group_metadata.get('dont_leave_group', True)
+                                group_metadata.get('dont_leave_group', True),
+                                group_metadata.get('group_delete_age_days', 30),
                                 )
 
     def process_column(self, col_num):
@@ -126,8 +127,20 @@ class AutoScrapeGroup:
         info = {}
         keys = self.df[col_num]
         values = self.df[col_num + 1]
-        for i in range(1, len(keys)):
+        last_key = ""
+        # iterate to longer of keys or values
+        for i in range(1, max(len(keys), len(values))):
+            # if last_key is set, but current key is not,
+            # then values should be set as a dictionary
+            if last_key and not keys[i] and values[i]:
+                if isinstance(info[last_key], list):
+                    # append new value to the list if already a list
+                    info[last_key].append(values[i])
+                else:
+                    # convert to list if not alredy a list
+                    info[last_key] = [info[last_key], values[i]]
             if keys[i] and values[i]:
+                last_key = keys[i] # set last_key for keys that should have lists of values
                 info[keys[i]] = values[i]
         logger.info("info = " + json.dumps(info, indent=4))
         return info

@@ -18,9 +18,27 @@ class AutoMakeGroupChat:
 
         self.autogroupchat_name = "AutoGroupChat"
 
+    def create_group(self, group_name: str, image: str, description: str):
+        raise NotImplementedError
+
     def add_members_group(self, group, members: dict):
         for name, number in members.items():
             self.add_member_group(group, name, number)
+
+    def add_member_group(self, name: str, phone_number: str):
+        raise NotImplementedError
+
+    def change_group_owner(self, group, name: str, phone_number: str):
+        raise NotImplementedError
+
+    def send_message_to_group(self, group, message: str):
+        raise NotImplementedError
+
+    def remove_self_group(self, group):
+        raise NotImplementedError
+
+    def purge_groups(self, group_delete_age_days: int):
+        raise NotImplementedError
 
     def group_startup(clazz,
                       config_file: str,
@@ -30,7 +48,8 @@ class AutoMakeGroupChat:
                       startup_messages: list[str]=[],
                       image: str=None,
                       description: str=None,
-                      dont_leave_group: bool=True):
+                      dont_leave_group: bool=True,
+                      group_delete_age_days: int=30):
         agc = clazz(config_file)
 
         if not description:
@@ -70,6 +89,6 @@ class AutoMakeGroupChat:
             agc.remove_self_group(group)
 
         # purge groups made by AutoGroupChat older than 30 days
-        agc.purge_groups()
+        agc.purge_groups(group_delete_age_days=group_delete_age_days)
 
         return group

@@ -40,7 +40,7 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
                 pass
         return retval
 
-    def purge_groups(self, timedelta=datetime.timedelta(days=30)):
+    def purge_groups(self, group_delete_age_days: int=30):
         for g in self.client.groups.list_all():
             # if description shows that it's an AutoGroupChat group
             if g.data['description'] == MESSAGE_ALWAYS_SEND:
@@ -48,6 +48,7 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
                 created_datetime = datetime.datetime.fromtimestamp(created_ms)
                 now_datetime = datetime.datetime.today()
                 # if is older than timedelta, defaults to 30 days
+                timedelta = datetime.timedelta(days=int(group_delete_age_days))
                 if (now_datetime - created_datetime) > timedelta:
                     if g.is_mine:
                         # I am the owner, destroy
