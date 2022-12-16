@@ -7,6 +7,7 @@ import datetime
 import pandas as pd
 
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -28,21 +29,30 @@ class AutoScrapeGoogleSheets(AutoScrapeGroup):
         super(AutoScrapeGoogleSheets, self).__init__(*args, **kwargs)
 
     def auth(self):
+        def user_interaction_auth():
+            flow = InstalledAppFlow.from_client_secrets_file(
+                self.api_config_file, SCOPES)
+            self.creds = flow.run_local_server(port=0)
+
         self.creds = None
         # The file token.json stores the user's access and refresh tokens, and is
         # created automatically when the authorization flow completes for the first
         # time.
         if os.path.exists(self.token_config_file):
-            self.creds = Credentials.from_authorized_user_file(
-                self.token_config_file, self.scopes)
+            try:
+                self.creds = Credentials.from_authorized_user_file(
+                    self.token_config_file, self.scopes)
+            except ValueError:
+                pass
         # If there are no (valid) credentials available, let the user log in.
         if not self.creds or not self.creds.valid:
             if self.creds and self.creds.expired and self.creds.refresh_token:
-                self.creds.refresh(Request())
+                try:
+                    self.creds.refresh(Request())
+                except RefreshError:
+                    user_interaction_auth()
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.api_config_file, SCOPES)
-                self.creds = flow.run_local_server(port=0)
+                user_interaction_auth()
             # Save the credentials for the next run
             try:
                 with open(self.token_config_file, 'w') as f:
