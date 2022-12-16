@@ -7,6 +7,7 @@ import datetime
 from groupy.client import Client
 from groupy.api.groups import Group
 from groupy.exceptions import BadResponse
+from requests.exceptions import HTTPError
 
 from autogroupchat.makers.automakegroupchat import AutoMakeGroupChat, MESSAGE_ALWAYS_SEND
 
@@ -36,7 +37,7 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
                 retval = func(*args, **kwargs)
                 # break out of loop if success
                 break
-            except BadResponse:
+            except BadResponse, HTTPError:
                 pass
         return retval
 
