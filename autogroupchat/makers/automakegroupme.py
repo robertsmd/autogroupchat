@@ -37,7 +37,7 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
                 retval = func(*args, **kwargs)
                 # break out of loop if success
                 break
-            except BadResponse, HTTPError:
+            except (BadResponse, HTTPError):
                 pass
         return retval
 
