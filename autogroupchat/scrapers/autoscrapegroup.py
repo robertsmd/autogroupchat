@@ -13,15 +13,12 @@ from googleapiclient.errors import HttpError
 
 from autogroupchat.makers.automakegroupme import AutoMakeGroupMe
 
-# If modifying these scopes, delete the file token.json.
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-
 global logger
 logger = logging.getLogger(__name__)
 
 
 class AutoScrapeGroup:
-    def __init__(self, spreadsheet, spreadsheet_range, api_config, token_config=None, scopes=SCOPES, *args, **kwargs):
+    def __init__(self, spreadsheet, spreadsheet_range, api_config, token_config=None, scopes=None, *args, **kwargs):
         self.spreadsheet = spreadsheet
         self.spreadsheet_range = spreadsheet_range
         self.api_config_file = api_config
