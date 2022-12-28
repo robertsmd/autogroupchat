@@ -56,9 +56,14 @@ class AutoScrapeGroup:
         for group in self.groups_to_create:
             group_metadata = self.info.copy()
             date = group[0]
+            group_metadata['date'] = date
             time = group[1]
+            group_metadata['time'] = time
             group_metadata['group_name'] = group_metadata['group_name'].format(
                 date=date, time=time)
+            group_metadata['startup_messages'] = [i.format(**group_metadata) 
+                                                  for i in group_metadata.get(
+                                                      'startup_messages', [])]
 
             members = {}
             # ignore the first two lines, they hold date and time respectively
