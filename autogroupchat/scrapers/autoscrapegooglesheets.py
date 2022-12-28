@@ -126,7 +126,7 @@ if __name__ == '__main__':
     parser.add_argument("spreadsheet")
     parser.add_argument("-r", "--range", default="Sheet1")
     parser.add_argument("-s", "--scopes", nargs="+",
-                        default=['https://www.googleapis.com/auth/spreadsheets.readonly'])
+                        default=SCOPES)
     parser.add_argument("--group-creation-class",
                         default="AutoMakeGroupMe")
     parser.add_argument("--group-creation-config",
