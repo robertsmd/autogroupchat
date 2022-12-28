@@ -95,7 +95,7 @@ class AutoScrapeGroup:
 
     def process_column(self, col_num):
         column = self.df[col_num]
-        if not column[0]:
+        if not isinstance(column[0], str):
             pass
         elif column[0].lower() == "key":
             self.info = self.get_keyvalue_info(col_num)
