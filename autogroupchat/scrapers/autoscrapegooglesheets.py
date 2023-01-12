@@ -6,19 +6,15 @@ import argparse
 import datetime
 import pandas as pd
 
-from google.auth.transport.requests import Request
-from google.auth.exceptions import RefreshError
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import gspread
 
 from autogroupchat.makers.automakegroupchat import AutoMakeGroupChat
 from autogroupchat.makers.automakegroupme import AutoMakeGroupMe
 from autogroupchat.scrapers.autoscrapegroup import AutoScrapeGroup
 
-# If modifying these scopes, delete the file token.json.
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+# requires spreadsheets and drive scopes
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly',
+          'https://www.googleapis.com/auth/drive.readonly']
 
 global logger
 logger = logging.getLogger(__name__)
@@ -29,57 +25,20 @@ class AutoScrapeGoogleSheets(AutoScrapeGroup):
         super(AutoScrapeGoogleSheets, self).__init__(*args, **kwargs)
 
     def auth(self):
-        def user_interaction_auth():
-            flow = InstalledAppFlow.from_client_secrets_file(
-                self.api_config_file, SCOPES)
-            self.creds = flow.run_local_server(port=0)
-
-        self.creds = None
-        # The file token.json stores the user's access and refresh tokens, and is
-        # created automatically when the authorization flow completes for the first
-        # time.
-        if os.path.exists(self.token_config_file):
-            try:
-                self.creds = Credentials.from_authorized_user_file(
-                    self.token_config_file, self.scopes)
-            except ValueError:
-                pass
-        # If there are no (valid) credentials available, let the user log in.
-        if not self.creds or not self.creds.valid:
-            if self.creds and self.creds.expired and self.creds.refresh_token:
-                try:
-                    self.creds.refresh(Request())
-                except RefreshError:
-                    user_interaction_auth()
-            else:
-                user_interaction_auth()
-            # Save the credentials for the next run
-            try:
-                with open(self.token_config_file, 'w') as f:
-                    json.dump(json.loads(self.creds.to_json()), f, indent=4)
-            except OSError:
-                logger.error(f"File {self.token_config_file} is not writable. Not writing token to disk.")
+        self.gspread_client = gspread.service_account(filename=self.api_config_file, scopes=SCOPES)
 
     def get_df(self):
-        try:
-            service = build('sheets', 'v4', credentials=self.creds)
+        spreadsheet = self.gspread_client.open(self.spreadsheet)
+        worksheet = spreadsheet.worksheet(self.spreadsheet_worksheet)
+        values = worksheet.get(self.spreadsheet_range)
 
-            # Call the Sheets API
-            sheet = service.spreadsheets()
-            result = sheet.values().get(spreadsheetId=self.spreadsheet,
-                                        range=self.spreadsheet_range).execute()
-            values = result.get('values', [])
+        if not values:
+            print(
+                f'No data found in spreadsheet `{self.spreadsheet}` sheet `{self.spreadsheet_worksheet}` range `{self.spreadsheet_range}`.')
+            return
 
-            if not values:
-                print(
-                    f'No data found in spreadsheet `{self.spreadsheet}` range `{self.spreadsheet_range}`.')
-                return
-
-            df = pd.DataFrame(values)
-            return df
-
-        except HttpError as err:
-            print(err)
+        df = pd.DataFrame(values)
+        return df
 
 
 def scrape_using_dict(args):
@@ -97,6 +56,7 @@ def scrape_using_dict(args):
 
     asg = AutoScrapeGoogleSheets(
         spreadsheet=args['spreadsheet'],
+        spreadsheet_worksheet=args['worksheet'],
         spreadsheet_range=args['range'],
         api_config=args['api_config'],
         token_config=args['token_config'],
@@ -124,7 +84,8 @@ if __name__ == '__main__':
     parser.add_argument("-t", "--token-config",
                         default=f"{os.path.dirname(__file__)}/../../configs/config_googleapi_token.json")
     parser.add_argument("spreadsheet")
-    parser.add_argument("-r", "--range", default="Sheet1")
+    parser.add_argument("-w", "--worksheet", default="Sheet1")
+    parser.add_argument("-r", "--range", default="")
     parser.add_argument("-s", "--scopes", nargs="+",
                         default=SCOPES)
     parser.add_argument("--group-creation-class",

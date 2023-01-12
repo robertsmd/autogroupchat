@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 class AutoScrapeGroup:
-    def __init__(self, spreadsheet, spreadsheet_range, api_config, token_config=None, scopes=None, *args, **kwargs):
+    def __init__(self, spreadsheet, spreadsheet_worksheet, spreadsheet_range, api_config, token_config=None, scopes=None, *args, **kwargs):
         self.spreadsheet = spreadsheet
+        self.spreadsheet_worksheet = spreadsheet_worksheet
         self.spreadsheet_range = spreadsheet_range
         self.api_config_file = api_config
         self.token_config_file = token_config
