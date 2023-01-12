@@ -59,7 +59,6 @@ def scrape_using_dict(args):
         spreadsheet_worksheet=args['worksheet'],
         spreadsheet_range=args['range'],
         api_config=args['api_config'],
-        token_config=args['token_config'],
         scopes=args['scopes'])
 
     asg.create_groups(args['group_creation_class'],
@@ -81,8 +80,6 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', '-v', action='store_true')
     parser.add_argument("-g", "--api-config", default=f"{os.path.dirname(__file__)}/../../configs/config_googleapi.json",
                         help="json configuration file specifying credentials")
-    parser.add_argument("-t", "--token-config",
-                        default=f"{os.path.dirname(__file__)}/../../configs/config_googleapi_token.json")
     parser.add_argument("spreadsheet")
     parser.add_argument("-w", "--worksheet", default="Sheet1")
     parser.add_argument("-r", "--range", default="")
