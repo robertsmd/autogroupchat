@@ -21,7 +21,7 @@ def autogroupchat_pubsub(event, context):
     """
     pubsub_message = base64.b64decode(event['data']).decode('utf-8')
     print(pubsub_message)
-    config = get_config("config_googlesheets_groupme.json")
+    config = get_config("configs/config_googlesheets_groupme.json")
 
     log_level = logging.INFO
     if config['verbose']:
@@ -33,5 +33,5 @@ def autogroupchat_pubsub(event, context):
 
 
 if __name__ == "__main__":
-    autogroupchat_test_pubsub(
+    autogroupchat_pubsub(
         {"data": "VGVzdGluZyBBdXRvR3JvdXBDaGF0Li4u"}, None)
