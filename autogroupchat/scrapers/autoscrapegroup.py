@@ -27,7 +27,7 @@ class AutoScrapeGroup:
         self.scopes = scopes
 
         if not self.token_config_file:
-            filename, ext = api_config_file.split(os.path.extsep)
+            filename, ext = self.api_config_file.split(os.path.extsep)
             self.token_config_file = f"{filename}_token{os.path.extsep}{ext}"
 
         self.args = args
