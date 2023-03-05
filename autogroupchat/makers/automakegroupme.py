@@ -75,10 +75,10 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
 
         # update group photo
         if image_url:
-            self._catch_bad_response(new_group.update, image_url=image_url, office_mode=False)
+            self._catch_bad_response(new_group.update, image_url=image_url)
         # update group description
         if description:
-            self._catch_bad_response(new_group.update, description=description, office_mode=False)
+            self._catch_bad_response(new_group.update, description=description)
         # new_group_id = new_group.id
         return new_group
 
