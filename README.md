@@ -90,6 +90,25 @@ The tutorial goes through these rough steps:
 
     ![Google Cloud Function source](/assets/images/google/google_cloud_function_source.png)
 
+4. Setup an alert if there are errors
+
+    4.1. Go to the `Logs` tab in the Google Cloud Functiono created above
+    
+    4.2. Click `View in Log Explorer`
+    
+    4.3. In log explorer, click `Create Alert`
+    
+        4.3.1. Pick a name for the alert message
+        
+        4.3.2. Choose logs to include in the alert (to alert on). (Recommend: `severity="ERROR"`)
+        
+        4.3.3. Set Notification Frequency and Autoclose Duration. Notification frequency is how often to send an alert if they are constantly erroring, Autoclose duration is when to automatically resolve the notification. 
+        
+        4.3.4. Set who should be notified. You can go into `Manage Notification Channels` to add a way to notify yourself.
+        
+        
+    4.4. To manage later, go to https://console.cloud.google.com/monitoring/alerting/policies
+
 ## Resources
 
  * API documentation for GroupMe Python project: https://groupy.readthedocs.io/en/latest/pages/api.html
