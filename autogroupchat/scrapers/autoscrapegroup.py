@@ -53,9 +53,12 @@ class AutoScrapeGroup:
             group_metadata['time'] = time
             group_metadata['group_name'] = group_metadata['group_name'].format(
                 date=date, time=time)
+            # if only one startup message, convert it to a list from a string
+            startup_messages_list = group_metadata.get('startup_messages', [])
+            if isinstance(startup_messages_list, str):
+                startup_messages_list = [startup_messages_list]
             group_metadata['startup_messages'] = [i.format(**group_metadata) 
-                                                  for i in group_metadata.get(
-                                                      'startup_messages', [])]
+                                                  for i in startup_messages_list]
 
             members = {}
             # ignore the first two lines, they hold date and time respectively
