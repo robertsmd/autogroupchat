@@ -35,6 +35,16 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
         while 1:
             try:
                 retval = func(*args, **kwargs)
+
+                # wait for results to be ready
+                if hasattr(retval, "is_ready"):
+                    while not retval.is_ready():
+                        pass
+
+                if hasattr(retval, "results"):
+                    if retval.results.failures:
+                        raise Exception(f"{func} call returned failure: {retval.results.failures}")
+
                 # break out of loop if success
                 break
             except (BadResponse, HTTPError):
