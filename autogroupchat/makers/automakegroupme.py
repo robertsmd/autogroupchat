@@ -93,7 +93,15 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
         return new_group
 
     def add_member_group(self, group: Group, member_display_name: str, member_number: str):
-        return self._catch_bad_response(group.memberships.add, member_display_name, phone_number=member_number)
+        try:
+            return self._catch_bad_response(group.memberships.add, member_display_name, phone_number=member_number)
+        except Exception as e:
+            if any([member_display_name in a for a in e.args]):
+                # if the error is a failure in adding a member, catch it
+                logger.error(f"Error adding member: '{member_display_name}' ({member_number})")
+            else:
+                # otherwise raise the error
+                raise e
 
     def change_group_owner(self, group: Group, name: str, phone_number: str):
         '''
