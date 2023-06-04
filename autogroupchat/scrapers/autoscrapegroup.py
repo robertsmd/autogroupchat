@@ -1,11 +1,7 @@
 import json
 import os.path
 import logging
-import argparse
 import datetime
-import pandas as pd
-
-from autogroupchat.makers.automakegroupme import AutoMakeGroupMe
 
 global logger
 logger = logging.getLogger(__name__)
@@ -65,7 +61,7 @@ class AutoScrapeGroup:
             for row in range(2, len(group)):
                 # if cell isn't empty, it's a mark that the person is included
                 if group[row]:
-                    member = self.contacts[row]
+                    member = self.contacts.get(row, {})  # defaults to empty so update doesnt fail
                     # member is a dictionary, and we want to add it to members
                     # so we use the update method to add/update.
                     members.update(member)
@@ -85,8 +81,7 @@ class AutoScrapeGroup:
                                 group_metadata.get('image', ''),
                                 group_metadata.get('description', ''),
                                 group_metadata.get('dont_leave_group', True),
-                                group_metadata.get('group_delete_age_days', 30),
-                                )
+                                group_metadata.get('group_delete_age_days', 30),)
 
     def process_column(self, col_num):
         column = self.df[col_num]
