@@ -44,9 +44,9 @@ class AutoScrapeGroup:
         for group in self.groups_to_create:
             group_metadata = self.info.copy()
             date = group[0]
-            group_metadata['date'] = date
+            group_metadata['date'] = date if date else ''
             time = group[1]
-            group_metadata['time'] = time
+            group_metadata['time'] = time if time else ''
             group_metadata['group_name'] = group_metadata['group_name'].format(
                 date=date, time=time)
             # if only one startup message, convert it to a list from a string
