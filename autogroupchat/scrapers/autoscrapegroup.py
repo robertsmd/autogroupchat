@@ -47,6 +47,7 @@ class AutoScrapeGroup:
             group_metadata['date'] = date if date else ''
             time = group[1]
             group_metadata['time'] = time if time else ''
+            group_metadata['group_name_unformatted'] = group_metadata['group_name']
             group_metadata['group_name'] = group_metadata['group_name'].format(
                 date=date, time=time)
             # if date or time were empty, replace double space with single.
