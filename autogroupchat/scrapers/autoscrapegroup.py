@@ -49,6 +49,8 @@ class AutoScrapeGroup:
             group_metadata['time'] = time if time else ''
             group_metadata['group_name'] = group_metadata['group_name'].format(
                 date=date, time=time)
+            # if date or time were empty, replace double space with single.
+            group_metadata['group_name'] = group_metadata['group_name'].replace('  ', ' ')
             # if only one startup message, convert it to a list from a string
             startup_messages_list = group_metadata.get('startup_messages', [])
             if isinstance(startup_messages_list, str):
