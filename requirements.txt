@@ -1,4 +1,3 @@
 gspread
-GroupyAPI
 pandas
 # git+https://github.com/robertsmd/autogroupchat.git
