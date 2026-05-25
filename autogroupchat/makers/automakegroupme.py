@@ -168,12 +168,11 @@ class Group:
         return self
 
     def update_membership(self, nickname):
-        membership_id = self._my_membership_id()
-        if not membership_id:
-            return None
+        # GroupMe: POST /groups/:group_id/memberships/update updates the caller's
+        # own membership. No membership_id is included in the path.
         return self.client._request(
             "POST",
-            f"/groups/{self.id}/memberships/{membership_id}/update",
+            f"/groups/{self.id}/memberships/update",
             json={"membership": {"nickname": nickname}},
         )
 
@@ -237,33 +236,42 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
     def __init__(self, *args, **kwargs):
         super(AutoMakeGroupMe, self).__init__(*args, **kwargs)
         self.groupme_token = self.config['groupme_token']
-        self.autogroupchat_name = "AutoGroupMe"
+        self.autogroupchat_name = "AutoGroupChat"
 
         self.client = _GroupMeClient(self.groupme_token)
 
-    def _catch_bad_response(self, func, *args, **kwargs):
-        retval = None
-        # loop for making sure the call succeeds.
-        # GroupMe's API occasionally returns transient 4xx/5xx; we retry.
-        while True:
+    def _catch_bad_response(self, func, *args, max_attempts=5, **kwargs):
+        last_exc = None
+        for attempt in range(max_attempts):
             try:
                 retval = func(*args, **kwargs)
 
-                # async results: wait for them to be ready
                 if hasattr(retval, "is_ready"):
-                    while not retval.is_ready():
+                    # async add-members poll, bounded
+                    for _ in range(60):  # ~30s max
+                        if retval.is_ready():
+                            break
                         time.sleep(0.5)
 
-                # surface failures from async add-member operations
                 if hasattr(retval, "results"):
                     if retval.results.failures:
                         raise Exception(
                             f"{func} call returned failure: {retval.results.failures}")
 
-                break
-            except HTTPError:
-                time.sleep(0.5)
-        return retval
+                return retval
+            except HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                # Don't retry client errors — they won't fix themselves.
+                if 400 <= status < 500 and status != 429:
+                    logger.error(
+                        f"{func.__name__} failed with {status}: {e.response.text if e.response is not None else e}")
+                    raise
+                last_exc = e
+                wait = min(2 ** attempt, 8)
+                logger.warning(
+                    f"{func.__name__} failed (attempt {attempt + 1}/{max_attempts}): {e}; retrying in {wait}s")
+                time.sleep(wait)
+        raise last_exc
 
     def purge_groups(self, group_delete_age_days: int = 30):
         for g in self.client.list_groups():
