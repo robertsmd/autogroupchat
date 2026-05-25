@@ -191,6 +191,30 @@ class Group:
         )
         return _AddMembersRequest(self, resp["results_id"])
 
+    def add_members(self, members):
+        """
+        Batch version of add_member. `members` is a list of dicts:
+            [{"nickname": "...", "phone_number": "..."}, ...]
+        GroupMe accepts up to ~10 per request. Returns one _AddMembersRequest
+        covering the whole batch.
+        """
+        payload = {"members": []}
+        for m in members:
+            entry = {
+                "nickname": m["nickname"],
+                "guid": str(uuid.uuid4()),
+            }
+            for key in ("phone_number", "email", "user_id"):
+                if m.get(key):
+                    entry[key] = m[key]
+            payload["members"].append(entry)
+
+        resp = self.client._request(
+            "POST", f"/groups/{self.id}/members/add",
+            json=payload,
+        )
+        return _AddMembersRequest(self, resp["results_id"])
+
     def change_owner(self, owner_user_id):
         return self.client._request(
             "POST", "/groups/change_owners",
@@ -240,21 +264,22 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
 
         self.client = _GroupMeClient(self.groupme_token)
 
-    def _catch_bad_response(self, func, *args, max_attempts=5, **kwargs):
+    def _catch_bad_response(self, func, *args, **kwargs):
+        max_attempts = kwargs.pop("_max_attempts", 5)
+        raise_on_partial = kwargs.pop("_raise_on_partial", True)   # <-- new
         last_exc = None
         for attempt in range(max_attempts):
             try:
                 retval = func(*args, **kwargs)
 
                 if hasattr(retval, "is_ready"):
-                    # async add-members poll, bounded
-                    for _ in range(60):  # ~30s max
+                    for _ in range(60):
                         if retval.is_ready():
                             break
                         time.sleep(0.5)
 
                 if hasattr(retval, "results"):
-                    if retval.results.failures:
+                    if raise_on_partial and retval.results.failures:    # <-- check flag
                         raise Exception(
                             f"{func} call returned failure: {retval.results.failures}")
 
@@ -310,16 +335,51 @@ class AutoMakeGroupMe(AutoMakeGroupChat):
 
         return new_group
 
-    def add_member_group(self, group: Group, member_display_name: str, member_number: str):
-        try:
-            return self._catch_bad_response(
-                group.add_member, member_display_name, phone_number=member_number)
-        except Exception as e:
-            if any(member_display_name in str(a) for a in e.args):
+    # def add_member_group(self, group: Group, member_display_name: str, member_number: str):
+    #     try:
+    #         return self._catch_bad_response(
+    #             group.add_member, member_display_name, phone_number=member_number)
+    #     except Exception as e:
+    #         if any(member_display_name in str(a) for a in e.args):
+    #             logger.error(
+    #                 f"Error adding member: '{member_display_name}' ({member_number})")
+    #         else:
+    #             raise
+
+    def add_members_group(self, group: Group, members: dict):
+        """
+        Batch-add members in groups of 10. Partial failures are logged but
+        don't abort — successfully-added members stay in the group.
+        """
+        items = [{"nickname": name, "phone_number": phone}
+                for name, phone in members.items()]
+        if not items:
+            return
+
+        BATCH_SIZE = 10
+        for i in range(0, len(items), BATCH_SIZE):
+            chunk = items[i:i + BATCH_SIZE]
+            chunk_names = [m["nickname"] for m in chunk]
+
+            try:
+                # _raise_on_partial=False so we can inspect failures ourselves
+                request = self._catch_bad_response(
+                    group.add_members, chunk, _raise_on_partial=False)
+
+                result = request.results
+                added = [m.nickname for m in result.members]
+                if added:
+                    logger.info(
+                        f"Batch added {len(added)}/{len(chunk)} members: {added}")
+                for failure in result.failures:
+                    logger.error(f"Failed to add in batch: {failure}")
+
+            except Exception as e:
                 logger.error(
-                    f"Error adding member: '{member_display_name}' ({member_number})")
-            else:
-                raise
+                    f"Batch submission failed for {chunk_names}: {e}")
+
+            # Be polite between batches — GroupMe rate-limits aggressively
+            time.sleep(1.0)
 
     def change_group_owner(self, group: Group, name: str, phone_number: str):
         '''

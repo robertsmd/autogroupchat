@@ -70,8 +70,9 @@ class AutoMakeGroupChat:
             agc.change_group_owner(group, admin_name, admin_phone_number)
 
         # add members
-        for member_name, member_number in members.items():
-            agc.add_member_group(group, member_name, member_number)
+        # for member_name, member_number in members.items():
+        #     agc.add_member_group(group, member_name, member_number)
+        agc.add_members_group(group, members)
 
         # send MESSAGE_ALWAYS_SEND
         agc.send_message_to_group(group, MESSAGE_ALWAYS_SEND)

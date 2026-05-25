@@ -63,11 +63,12 @@ class AutoScrapeGroup:
             # ignore the first two lines, they hold date and time respectively
             for row in range(2, len(group)):
                 # if cell isn't empty, it's a mark that the person is included
-                if group[row]:
+                if group[row] and str(group[row]) != "nan":
                     member = self.contacts.get(row, {})  # defaults to empty so update doesnt fail
                     # member is a dictionary, and we want to add it to members
                     # so we use the update method to add/update.
                     members.update(member)
+                    print(f"Including person because there was a non-empty group[row]: `{group[row]}`")
 
             group_metadata['members'] = members
             logger.info("group_metadata = " +
