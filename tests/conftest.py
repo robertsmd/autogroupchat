@@ -192,6 +192,9 @@ class FakeGcsBlob:
                               if_generation_match: int | None = None,
                               **kwargs: Any) -> None:
         """Write the contents of the file at `path` under the given precondition."""
+        self._client.transfers.append(
+            ("upload", self.name, kwargs.get("timeout")))
+
         with open(path, "rb") as f:
             self._write(f.read(), if_generation_match)
 
@@ -202,8 +205,11 @@ class FakeGcsBlob:
 
         return self._client.objects[self.name]
 
-    def download_to_filename(self, path: str) -> None:
+    def download_to_filename(self, path: str, **kwargs: Any) -> None:
         """Write this object's content to the file at `path`."""
+        self._client.transfers.append(
+            ("download", self.name, kwargs.get("timeout")))
+
         with open(path, "wb") as f:
             f.write(self.download_as_bytes())
 
@@ -267,6 +273,9 @@ class FakeGcsClient:
         self.generations: dict[str, int] = {}
         self.writes: list[tuple[str, int | None]] = []
         self.deletes: list[str] = []
+        # (operation, object name, timeout) per store transfer, so the 60 s
+        # reserved for moving the store can be asserted rather than assumed.
+        self.transfers: list[tuple[str, str, float | None]] = []
 
     def bucket(self, name: str) -> FakeGcsBucket:
         """Return a bucket handle. All bucket names share the same object store."""

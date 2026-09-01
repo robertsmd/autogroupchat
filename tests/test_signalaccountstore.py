@@ -9,6 +9,7 @@ import tarfile
 import pytest
 
 from autogroupchat.makers.signalaccountstore import (
+    GCS_TRANSFER_TIMEOUT_SECONDS,
     AccountStoreError,
     GcsStore,
     LocalStore,
@@ -450,3 +451,32 @@ def test_gcs_config_requires_bucket_and_object(tmp_path):
             GcsStore(config, client=FakeGcsClient())
 
         assert missing in str(exc.value)
+
+
+def test_both_store_transfers_carry_an_explicit_timeout(tmp_path):
+    """
+    The invocation budget reserves 60 s of the platform's 540 s for moving the
+    store, but the google-cloud-storage default is its own retry deadline, not
+    ours. Without a timeout on each transfer that reserve is enforced nowhere,
+    and a stalled download or upload runs until Cloud Run kills the container
+    -- for the upload, after messages have already been sent.
+    """
+    client = FakeGcsClient()
+    seed_store(client, {"account.db": "x"})
+    store = GcsStore(gcs_config(tmp_path), client=client)
+
+    store.acquire()
+    store.release(None)
+
+    assert client.transfers == [
+        ("download", OBJECT, GCS_TRANSFER_TIMEOUT_SECONDS),
+        ("upload", OBJECT, GCS_TRANSFER_TIMEOUT_SECONDS),
+    ]
+
+
+def test_transfer_timeout_fits_inside_the_reserve():
+    """
+    Both transfers must fit in the reserve with room to spare, or the timeout
+    is decoration. 2 x 25 = 50 s against a 60 s reserve.
+    """
+    assert 2 * GCS_TRANSFER_TIMEOUT_SECONDS < 60

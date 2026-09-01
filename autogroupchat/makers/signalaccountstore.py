@@ -174,6 +174,16 @@ DEFAULT_LOCK_TTL_SECONDS = 900
 # GCS spells "this object must not already exist" as generation 0.
 GENERATION_ABSENT = 0
 
+# Per-transfer ceiling, derived from the store-transfer reserve rather than
+# picked: automakesignal reserves 540 - 480 = 60 s of the platform ceiling for
+# moving the store, and one invocation makes two transfers (a download in
+# acquire, an upload in release), so 60 / 2 = 30 s each. 25 leaves 10 s for the
+# tar, the lock round trips and the unlock. Not imported from automakesignal:
+# that module imports this one, and the reserve is restated here rather than
+# creating a cycle. A transfer still running at 25 s would not have finished
+# inside the reserve either.
+GCS_TRANSFER_TIMEOUT_SECONDS = 25
+
 
 class GcsStore(AccountStore):
     """
@@ -358,7 +368,8 @@ class GcsStore(AccountStore):
     def _extract(self, blob: Any) -> None:
         """Download the tarball and unpack it into the work dir."""
         with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
-            blob.download_to_filename(tmp.name)
+            blob.download_to_filename(
+                tmp.name, timeout=GCS_TRANSFER_TIMEOUT_SECONDS)
             with tarfile.open(tmp.name, mode="r:gz") as tar:
                 # filter="data" rejects device files, absolute paths and
                 # symlinks escaping work_dir; explicit rather than relying
@@ -402,7 +413,9 @@ class GcsStore(AccountStore):
             blob = self._bucket().blob(self.object_name)
             try:
                 blob.upload_from_filename(
-                    archive, if_generation_match=self._generation)
+                    archive,
+                    if_generation_match=self._generation,
+                    timeout=GCS_TRANSFER_TIMEOUT_SECONDS)
             except self._precondition_types() as e:
                 raise AccountStoreError(
                     f"gs://{self.bucket_name}/{self.object_name} changed under "
