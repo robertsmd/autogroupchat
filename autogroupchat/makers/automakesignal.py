@@ -164,7 +164,16 @@ class Delete(Enum):
 
 
 class SignalCliError(Exception):
-    """A signal-cli invocation exited non-zero."""
+    """
+    A signal-cli invocation failed.
+
+    Usually that means a non-zero exit, and `exit_code` is signal-cli's own
+    status. It is legitimately ExitCode.SUCCESS on the paths where the process
+    exited 0 but its output could not be used -- unparseable JSON, updateGroup
+    reporting no groupId, --version reporting no version. Those are client-side
+    failures with no signal-cli status of their own, and fabricating one would
+    misinform anything keying off `exit_code`, the retry policy included.
+    """
 
     def __init__(self, exit_code: int, stderr: str, argv: list[str]) -> None:
         """
@@ -529,9 +538,12 @@ class SignalCli:
 
         group_id = response.get("groupId")
         if not group_id:
+            # SUCCESS, not a fabricated code: the process exited 0 and only
+            # its output was unusable, exactly as in the non-dict branch above.
             raise SignalCliError(
-                int(ExitCode.UNEXPECTED),
-                "updateGroup returned no groupId, so no group was created",
+                int(ExitCode.SUCCESS),
+                "updateGroup exited 0 but returned no groupId, so no group "
+                "was created",
                 self.argv("updateGroup", *args),
             )
 
@@ -631,8 +643,11 @@ class SignalCli:
         stdout = self._run_bare("--version")
         parts = stdout.strip().split()
         if not parts:
+            # _run_bare only returns on a zero exit, so 0 is the real code.
             raise SignalCliError(
-                int(ExitCode.UNEXPECTED), "no version reported", [self.binary])
+                int(ExitCode.SUCCESS),
+                "--version exited 0 but reported no version",
+                [self.binary])
 
         numbers: list[int] = []
         for component in parts[-1].split("."):

@@ -648,3 +648,44 @@ def test_run_propagates_a_subprocess_timeout():
         cli.run("listGroups")
 
     assert runner.timeouts == [5.0]
+
+
+def test_create_group_carries_the_real_exit_code_when_no_group_id_came_back():
+    """
+    The process exited 0; only its output was unusable. Fabricating
+    ExitCode.UNEXPECTED here misinformed anything keying off .exit_code, and
+    disagreed with the sibling branch a few lines above -- the non-dict
+    response -- which reports the same situation as SUCCESS.
+    """
+    runner = FakeRunner().queue(0, UPDATED_GROUP_JSON)
+    cli = make_cli(runner)
+
+    with pytest.raises(SignalCliError) as exc_info:
+        cli.create_group("Test Group", "desc")
+
+    assert exc_info.value.exit_code == int(ExitCode.SUCCESS)
+
+
+def test_create_group_error_branches_agree_on_the_exit_code():
+    """Both "no groupId could be read" branches must report the same code."""
+    non_dict = FakeRunner().queue(0, json.dumps(["not", "an", "object"]))
+    no_group_id = FakeRunner().queue(0, UPDATED_GROUP_JSON)
+
+    with pytest.raises(SignalCliError) as first:
+        make_cli(non_dict).create_group("Test Group", "desc")
+
+    with pytest.raises(SignalCliError) as second:
+        make_cli(no_group_id).create_group("Test Group", "desc")
+
+    assert first.value.exit_code == second.value.exit_code
+
+
+def test_version_carries_the_real_exit_code_when_nothing_was_reported():
+    """--version exited 0 and printed nothing; 0 is the real code."""
+    runner = FakeRunner().queue(0, "   \n")
+    cli = make_cli(runner)
+
+    with pytest.raises(SignalCliError) as exc_info:
+        cli.version()
+
+    assert exc_info.value.exit_code == int(ExitCode.SUCCESS)
