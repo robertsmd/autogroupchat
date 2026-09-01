@@ -663,8 +663,13 @@ def parse_stamp(description: str | None) -> tuple[int, datetime.date] | None:
 
     Returns the version even when unrecognised, so the caller can log "unknown
     stamp version" rather than silently treating a future format as foreign.
+
+    A description that is not text at all (e.g. a malformed listing entry)
+    cannot be our stamp either, so it is treated the same way as "not ours"
+    rather than raising: re.match requires str/bytes, and a caller such as
+    purge_groups must not be able to crash the whole sweep on one bad group.
     """
-    if not description:
+    if not isinstance(description, str) or not description:
         return None
 
     match = STAMP_RE.match(description)
@@ -999,13 +1004,14 @@ class AutoMakeSignal(AutoMakeGroupChat):
         """Send one message to the group."""
         self.cli.send_group(group, message)
 
-    def successors_from_listing(self, listing: dict[str, Any]) -> list[str]:
+    def _successors_from_listing(self, listing: dict[str, Any]) -> list[str]:
         """
         Pick promotion candidates from an already-fetched group listing.
 
         Pure selection logic pulled out of successors_for_leave, so
         purge_groups can reuse the listing from its own list_groups() call
-        instead of re-fetching once per purge candidate.
+        instead of re-fetching once per purge candidate. Private: called only
+        from within this class (successors_for_leave, purge_groups).
 
         Empty unless we are the only admin and somebody else remains. The pick
         is sorted by uuid so it is reproducible rather than dependent on dict
@@ -1043,7 +1049,7 @@ class AutoMakeSignal(AutoMakeGroupChat):
         if listing is None:
             return []
 
-        return self.successors_from_listing(listing)
+        return self._successors_from_listing(listing)
 
     def remove_self_group(self, group: str) -> None:
         """
@@ -1065,30 +1071,51 @@ class AutoMakeSignal(AutoMakeGroupChat):
         logged; see purge_decision for the full fail-closed rule.
 
         Successor selection reuses the listing already in hand from the
-        list_groups() call above via successors_from_listing, rather than
+        list_groups() call above via _successors_from_listing, rather than
         successors_for_leave's own re-fetch -- that would cost one redundant
         signal-cli call per purge candidate for no benefit.
 
-        One group failing does not stop the others: a group we cannot leave
-        should not strand the whole cleanup.
+        One group failing must not stop the others -- a group we cannot leave,
+        or cannot even evaluate, should not strand the whole cleanup. This is
+        why every per-group step below sits inside the loop's own try: a
+        malformed entry (parse_stamp is guarded at its root against a
+        non-string description, but that is one known failure mode, not every
+        possible one) or a quit failure both log and move on to the next
+        group instead of aborting the sweep. purge_groups runs at the tail of
+        group_startup, so an abort here would silently skip the rest of that
+        sweep's cleanup with nothing to retry it.
         """
         today = self._today()
 
         for group in self.cli.list_groups():
             group_id = group.get("id")
-            decision = purge_decision(group, today, group_delete_age_days)
-
-            if decision is not PurgeDecision.PURGE:
-                logger.info(
-                    f"keeping group {group_id} ({group.get('name')!r}): "
-                    f"{decision.value}")
+            if not group_id:
+                # An id-less entry can't be addressed by quitGroup at all --
+                # signal-cli would see the literal string "None" as -g and
+                # reject it. Skipping is the only safe action available.
+                logger.error(
+                    f"skipping group listing with no id: {group.get('name')!r}")
                 continue
 
             try:
+                decision = purge_decision(group, today, group_delete_age_days)
+
+                if decision is not PurgeDecision.PURGE:
+                    logger.info(
+                        f"keeping group {group_id} ({group.get('name')!r}): "
+                        f"{decision.value}")
+                    continue
+
                 self.cli.quit_group(
-                    group_id, new_admins=self.successors_from_listing(group))
+                    group_id, new_admins=self._successors_from_listing(group))
                 logger.info(
                     f"purged group {group_id} ({group.get('name')!r})")
             except SignalCliError as e:
                 logger.error(
                     f"could not purge group {group_id}: {e.stderr.strip()}")
+            except Exception as e:
+                # Safety net for failure modes neither purge_decision's own
+                # guards nor this loop's callers anticipated -- one bad group
+                # must still not abort the rest of the sweep.
+                logger.error(
+                    f"could not evaluate group {group_id} for purge: {e}")

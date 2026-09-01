@@ -80,11 +80,18 @@ def test_parse_stamp_round_trips():
     "autogroupchat:1:not-a-date",
     " autogroupchat:1:2026-08-31 leading space",
     "prefixed autogroupchat:1:2026-08-31",
+    12345,
+    {"not": "a string"},
 ])
 def test_parse_stamp_refuses_anything_off_grammar(description):
     """
     Fail-closed: an unparseable description must not become a purge candidate.
     The anchor matters -- a stamp anywhere but the start does not count.
+
+    Review finding (Important 1): a non-string description (int, dict -- a
+    malformed listing entry) must not raise. re.match requires str/bytes, so
+    without the isinstance guard this crashes purge_decision and, through it,
+    the whole purge_groups sweep on a single bad group.
     """
     assert parse_stamp(description) is None
 
@@ -567,6 +574,52 @@ def test_purge_continues_after_one_group_fails(config_file):
 
     quits = [c for c in runner.calls if "quitGroup" in c]
     assert len(quits) == 2
+
+
+def test_purge_continues_past_a_malformed_entry(config_file):
+    """
+    Review finding (Important 1): a malformed listing entry -- here a
+    non-string description, reproducing signal-cli returning something
+    unexpected -- must not abort the sweep for the groups around it.
+    Without the parse_stamp guard (and the loop's own catch-all), this
+    raised TypeError out of purge_decision and 'second' was never evaluated.
+    """
+    runner = FakeRunner()
+    malformed = listing_entry(id="bad", description=12345)
+    runner.queue(0, json.dumps([listing_entry(id="first"), malformed,
+                                listing_entry(id="second")]))
+    runner.queue(0, "{}")
+    runner.queue(0, "{}")
+
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.purge_groups(group_delete_age_days=30)
+
+    quits = [c for c in runner.calls if "quitGroup" in c]
+    quit_ids = [q[q.index("-g") + 1] for q in quits]
+    assert quit_ids == ["first", "second"]
+
+
+def test_purge_skips_listing_entries_with_no_id(config_file, caplog):
+    """
+    Review finding (Minor): an id-less entry can't be passed to quitGroup at
+    all -- signal-cli would see the literal string "None" as -g and reject
+    it. Skip rather than attempt it.
+    """
+    entry = listing_entry()
+    del entry["id"]
+    runner = FakeRunner().queue(0, json.dumps([entry]))
+
+    maker = make_maker(config_file, runner)
+
+    with caplog.at_level("ERROR"):
+        with maker.session():
+            maker.purge_groups(group_delete_age_days=30)
+
+    quits = [c for c in runner.calls if "quitGroup" in c]
+    assert quits == []
+    assert "no id" in caplog.text.lower()
 
 
 def test_successors_names_a_member_when_we_are_the_only_admin(config_file):
