@@ -1,8 +1,19 @@
 """Shared test doubles. No test in this suite executes signal-cli or touches GCS."""
 
-from typing import Any
+import subprocess
+from typing import Any, Callable, Iterator
 
 from autogroupchat.makers.signalaccountstore import PreconditionFailed
+
+
+class _QueuedTimeout:
+    """
+    Sentinel queued by FakeRunner.queue_timeout, raised when it is reached.
+
+    A queued result is a returned tuple, which cannot express the one thing
+    the real runner does that no exit code covers: subprocess.run killing an
+    overrunning process and raising instead of returning.
+    """
 
 
 class FakeRunner:
@@ -17,11 +28,23 @@ class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.timeouts: list[float] = []
-        self._results: list[tuple[int, str, str]] = []
+        self._results: list[tuple[int, str, str] | _QueuedTimeout] = []
 
     def queue(self, exit_code: int, stdout: str = "", stderr: str = "") -> "FakeRunner":
         """Append one result to be returned by a later call. Chainable."""
         self._results.append((exit_code, stdout, stderr))
+        return self
+
+    def queue_timeout(self) -> "FakeRunner":
+        """
+        Queue a subprocess.TimeoutExpired instead of a result. Chainable.
+
+        This is what the real runner does when work starts with seconds left
+        on the deadline and overruns them: subprocess.run kills the process
+        and raises, carrying whatever it had captured away with it. No exit
+        code can stand in for that, so it needs its own queue entry.
+        """
+        self._results.append(_QueuedTimeout())
         return self
 
     def __call__(self, argv: list[str], timeout: float | None) -> tuple[int, str, str]:
@@ -31,7 +54,11 @@ class FakeRunner:
         if not self._results:
             return (0, "", "")
 
-        return self._results.pop(0)
+        result = self._results.pop(0)
+        if isinstance(result, _QueuedTimeout):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout or 0)
+
+        return result
 
     @property
     def last(self) -> list[str]:
@@ -223,3 +250,61 @@ class FakeGcsClient:
     def bucket(self, name: str) -> FakeGcsBucket:
         """Return a bucket handle. All bucket names share the same object store."""
         return FakeGcsBucket(self)
+
+
+class FakeLinkProcess:
+    """
+    A launched process that streams stdout lines and only then reports exit.
+
+    Exists because the ordering is the whole point of the `link` seam:
+    signal-cli prints the `sgnl://` URI and then blocks until the operator
+    scans it, so a test must be able to see what reached the operator *while
+    the process was still running*. `on_wait` fires inside wait() -- after
+    every line has been yielded, before link() can return -- which is the
+    only moment at which that distinction is observable.
+    """
+
+    def __init__(self,
+                 lines: list[str],
+                 *,
+                 exit_code: int = 0,
+                 on_wait: Callable[[], None] | None = None) -> None:
+        """Yield `lines` from stdout, then exit with `exit_code`."""
+        self.stdout: Iterator[str] = iter(lines)
+        self.exit_code = exit_code
+        self.waited = False
+        self._on_wait = on_wait
+
+    def wait(self) -> int:
+        """Report the exit status, notifying `on_wait` first."""
+        self.waited = True
+
+        if self._on_wait is not None:
+            self._on_wait()
+
+        return self.exit_code
+
+
+class FakeLauncher:
+    """
+    Stands in for the process launcher SignalCli.link uses.
+
+    Separate from FakeRunner because a Runner returns finished output: it
+    cannot represent a process that is still running, which is exactly the
+    state `link` spends its whole life in.
+    """
+
+    def __init__(self, process: FakeLinkProcess) -> None:
+        """Hand out `process` for every launch, recording the argv used."""
+        self.process = process
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> FakeLinkProcess:
+        """Record `argv` and return the queued process."""
+        self.calls.append(list(argv))
+        return self.process
+
+    @property
+    def last(self) -> list[str]:
+        """argv of the most recent launch."""
+        return self.calls[-1]

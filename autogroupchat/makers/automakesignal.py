@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import TracebackType
-from typing import Any, Callable, Iterator
+from typing import IO, Any, Callable, Iterator, Protocol
 
 from autogroupchat.makers.automakegroupchat import (
     MESSAGE_ALWAYS_SEND,
@@ -205,6 +205,48 @@ def _subprocess_runner(
     return (completed.returncode, completed.stdout, completed.stderr)
 
 
+class StreamingProcess(Protocol):
+    """
+    A launched process whose stdout can be read line by line as it runs.
+
+    The Runner seam above cannot express this: it returns output that is
+    already complete, so a command whose output must be read *while the
+    process is still running* needs its own seam. `subprocess.Popen`
+    satisfies this protocol as-is.
+    """
+
+    stdout: IO[str] | None
+
+    def wait(self) -> int:
+        """Block until the process exits, then return its exit status."""
+
+
+# argv -> a running process. No timeout parameter: the only caller is `link`,
+# which waits on a human.
+Launcher = Callable[[list[str]], StreamingProcess]
+
+
+def _popen_launcher(argv: list[str]) -> StreamingProcess:
+    """
+    Default Launcher: line-buffered text output, stderr folded into stdout.
+
+    bufsize=1 with text=True gives line buffering on our side of the pipe, so
+    each line becomes readable when signal-cli writes it rather than when the
+    process exits. stderr is merged rather than piped separately because
+    nothing reads a second pipe concurrently, and a full stderr buffer would
+    block the process we are waiting on.
+
+    Never invoked by unit tests, which inject their own.
+    """
+    return subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+
 class SignalCli:
     """
     Thin driver over the signal-cli binary.
@@ -222,6 +264,7 @@ class SignalCli:
                  trust_new_identities: str = DEFAULT_TRUST_NEW_IDENTITIES,
                  deadline: float | None = None,
                  runner: Runner | None = None,
+                 launcher: Launcher | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic) -> None:
         """
@@ -240,6 +283,11 @@ class SignalCli:
             runner: Seam for the subprocess call: (argv, timeout) ->
                 (exit_code, stdout, stderr). Tests inject a fake here so the
                 real binary is never executed.
+            launcher: Seam for launching a process whose output is streamed
+                rather than captured, used only by `link`. Separate from
+                `runner` because a Runner's output is already complete by
+                the time it returns, and `link` must show its URI while the
+                process is still running.
             sleep: Seam for backoff waits. Tests inject a fake here so no
                 test actually sleeps.
             clock: Seam for reading the current time against `deadline`.
@@ -253,6 +301,7 @@ class SignalCli:
         self.deadline = deadline
 
         self._run_process = runner or _subprocess_runner
+        self._launch = launcher or _popen_launcher
         self._sleep = sleep
         self._clock = clock
 
@@ -542,12 +591,50 @@ class SignalCli:
 
         return tuple(numbers)
 
+    def link(self, name: str) -> None:
+        """
+        Provision this data dir as a secondary device, streaming as it goes.
+
+        `signal-cli link` prints an `sgnl://linkdevice?...` URI and then blocks
+        until the operator scans it from the phone's Signal app -- it must, or
+        provisioning never completes and the data dir holds no account. So the
+        output is echoed line by line as it arrives: capturing it and printing
+        it after the process exits cannot work, because the process cannot exit
+        until someone scans a URI they were never shown.
+
+        No deadline, for the same reason: a human at a QR code is not on the
+        platform's invocation budget, so this bypasses _check_budget as well as
+        argv() (signal-cli forbids -a on `link`).
+
+        Args:
+            name: Device name shown in Signal's Linked Devices list.
+
+        Raises:
+            SignalCliError: signal-cli exited non-zero. Its streamed output
+                stands in for stderr, which the launcher folds into stdout.
+        """
+        argv = [self.binary, "--data-dir", self.data_dir, "link", "-n", name]
+        process = self._launch(argv)
+
+        output: list[str] = []
+
+        # Echo each line the moment it arrives; a URI still sitting in a pipe
+        # buffer cannot be scanned, and nothing else will end the wait.
+        if process.stdout is not None:
+            for line in process.stdout:
+                output.append(line)
+                print(line.rstrip("\n"), flush=True)
+
+        exit_code = process.wait()
+        if exit_code != int(ExitCode.SUCCESS):
+            raise SignalCliError(exit_code, "".join(output), argv)
+
     def _run_bare(self, *args: str) -> str:
         """
-        Run the binary with no account globals, for --version and link.
+        Run the binary with no account globals, for --version.
 
-        `link` forbids -a entirely, and --version needs no account, so neither
-        can go through argv().
+        --version needs no account, so it cannot go through argv(), which
+        always emits the global -a.
         """
         remaining = self._check_budget(f"running {args[0] if args else 'binary'}")
         timeout = self._timeout(remaining)
@@ -1290,17 +1377,16 @@ def run_link(args: argparse.Namespace) -> None:
     """
     Link this account as a secondary device, then persist the new store.
 
-    One-time and human-driven: the printed sgnl:// URI must be scanned from the
-    phone's Signal app. signal-cli forbids -a on `link`, so this bypasses the
-    usual globals.
+    One-time and human-driven: SignalCli.link streams the sgnl:// URI to the
+    operator as signal-cli emits it, then blocks until the phone scans it, at
+    which point the session's exit persists the newly provisioned store.
     """
     maker = AutoMakeSignal(args.config_file)
 
     with maker.session(on_missing=OnMissing.EMPTY) as cli:
         logger.info("scan the URI below from Signal on your phone: "
                     "Settings > Linked Devices > +")
-        print(cli._run_bare(
-            "--data-dir", cli.data_dir, "link", "-n", args.name))
+        cli.link(args.name)
 
 
 def run_register(args: argparse.Namespace) -> None:

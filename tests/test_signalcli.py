@@ -1,6 +1,7 @@
 """Tests for the SignalCli driver (spec sections 7, 10)."""
 
 import json
+import subprocess
 
 import pytest
 
@@ -14,7 +15,13 @@ from autogroupchat.makers.automakesignal import (
     SignalCli,
     SignalCliError,
 )
-from tests.conftest import FakeClock, FakeRunner, FakeSleeper
+from tests.conftest import (
+    FakeClock,
+    FakeLauncher,
+    FakeLinkProcess,
+    FakeRunner,
+    FakeSleeper,
+)
 
 NUMBER = "+15551234567"
 DATA_DIR = "/tmp/signal-cli"
@@ -521,3 +528,123 @@ def test_version_raises_on_a_non_zero_exit():
 
     with pytest.raises(SignalCliError):
         cli.version()
+
+
+def make_link_cli(launcher: FakeLauncher,
+                  runner: FakeRunner | None = None,
+                  **kwargs) -> SignalCli:
+    """A driver whose `link` is wired to `launcher` instead of real Popen."""
+    return SignalCli(
+        NUMBER, DATA_DIR,
+        binary="/opt/signal-cli/signal-cli",
+        runner=runner or FakeRunner(),
+        launcher=launcher,
+        **kwargs,
+    )
+
+
+def test_link_prints_the_uri_before_the_process_exits(capsys):
+    """
+    The defect this guards: signal-cli link prints the sgnl:// URI and then
+    blocks until the phone scans it. Capturing output and printing it after
+    the process exits therefore deadlocks by construction -- the process
+    cannot exit until someone scans a URI they were never shown.
+
+    Ordering is the assertion. capsys is read from inside wait(), so what it
+    returns is exactly what had reached the operator while the process was
+    still running.
+    """
+    seen: dict[str, str] = {}
+
+    def snapshot_output_at_exit() -> None:
+        seen["before_exit"] = capsys.readouterr().out
+
+    process = FakeLinkProcess(
+        ["sgnl://linkdevice?uuid=abc&pub_key=def\n", "Associated with +1555\n"],
+        on_wait=snapshot_output_at_exit)
+    cli = make_link_cli(FakeLauncher(process))
+
+    cli.link("autogroupchat")
+
+    assert process.waited
+    assert "sgnl://linkdevice?uuid=abc&pub_key=def" in seen["before_exit"]
+
+
+def test_link_echoes_every_line(capsys):
+    process = FakeLinkProcess(["sgnl://linkdevice?x=1\n", "done\n"])
+    cli = make_link_cli(FakeLauncher(process))
+
+    cli.link("autogroupchat")
+
+    out = capsys.readouterr().out
+
+    assert "sgnl://linkdevice?x=1" in out
+    assert "done" in out
+
+
+def test_link_argv_omits_the_account_and_json_globals():
+    """signal-cli forbids -a on `link`, so this cannot go through argv()."""
+    launcher = FakeLauncher(FakeLinkProcess(["sgnl://x\n"]))
+    cli = make_link_cli(launcher)
+
+    cli.link("autogroupchat")
+
+    assert launcher.last == [
+        "/opt/signal-cli/signal-cli",
+        "--data-dir", DATA_DIR,
+        "link", "-n", "autogroupchat",
+    ]
+
+
+def test_link_ignores_an_exhausted_budget():
+    """
+    A human scanning a QR code is not on the platform's invocation budget.
+    Enforcing the deadline here would kill the bootstrap that creates the
+    account store in the first place.
+    """
+    clock = FakeClock(now=1_000.0)
+    launcher = FakeLauncher(FakeLinkProcess(["sgnl://x\n"]))
+    cli = make_link_cli(launcher, deadline=500.0, clock=clock)
+
+    cli.link("autogroupchat")
+
+    assert launcher.calls
+
+
+def test_link_raises_on_a_non_zero_exit():
+    process = FakeLinkProcess(["provisioning failed\n"], exit_code=1)
+    cli = make_link_cli(FakeLauncher(process))
+
+    with pytest.raises(SignalCliError) as exc_info:
+        cli.link("autogroupchat")
+
+    assert exc_info.value.exit_code == 1
+    assert "provisioning failed" in str(exc_info.value)
+
+
+def test_link_never_uses_the_capturing_runner():
+    """The Runner seam returns finished output; `link` must not touch it."""
+    runner = FakeRunner()
+    cli = make_link_cli(FakeLauncher(FakeLinkProcess(["sgnl://x\n"])), runner)
+
+    cli.link("autogroupchat")
+
+    assert runner.calls == []
+
+
+def test_run_propagates_a_subprocess_timeout():
+    """
+    Work that starts with seconds left on the deadline and overruns them is
+    not a signal-cli exit code: subprocess.run kills the process and raises.
+    Nothing in this module catches that, deliberately -- a killed process has
+    an unknown effect on the account, so it must not be retried or reported
+    as anything but a hard failure.
+    """
+    runner = FakeRunner().queue_timeout()
+    clock = FakeClock(now=0.0)
+    cli = make_cli(runner, deadline=5.0, clock=clock, sleep=FakeSleeper())
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        cli.run("listGroups")
+
+    assert runner.timeouts == [5.0]
