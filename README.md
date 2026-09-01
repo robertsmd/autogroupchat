@@ -171,6 +171,8 @@ gsutil mb -b on gs://<state_bucket_name>
 gsutil versioning set on gs://<state_bucket_name>
 ```
 
+**Lock this bucket down before anything lands in it.** The object it holds is the account's identity private key and ratchet state, not a token -- **read access to it is full control of the Signal account**, and there is nothing to rotate afterwards. Grant `roles/storage.objectAdmin` to the deploying service account alone, scoped to the `signal-cli/` prefix with an IAM condition (the store object and its lock must be read, written and overwritten); if a prefix condition is more trouble than it is worth, use a dedicated bucket for this and nothing else. Remove `projectEditor`/`projectViewer` legacy access, and grant no human user read on it.
+
 **2. Build, push and deploy:**
 
 ```bash
@@ -213,8 +215,10 @@ functions-framework is started with `--signature-type=event` (see the `CMD` in `
 **5. Uploading the linked store, once**, after running `link` locally -- the account cannot be linked from inside the container; linking needs a human scanning a QR code:
 
 ```bash
+umask 077   # the tarball below contains the account's identity private key
 tar -czf store.tar.gz -C <local_data_dir> .
 gsutil cp store.tar.gz gs://<state_bucket_name>/signal-cli/<+15551234567>.tar.gz
+shred -u store.tar.gz   # or `rm -P` / `rm`; do not leave it in your CWD
 ```
 
 After this, every deployed invocation just serves; the account is not re-linked again unless the store is lost (below).
