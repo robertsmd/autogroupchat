@@ -79,13 +79,22 @@ class SignalCliError(Exception):
     """A signal-cli invocation exited non-zero."""
 
     def __init__(self, exit_code: int, stderr: str, argv: list[str]) -> None:
+        """
+        Args:
+            exit_code: signal-cli's exit status.
+            stderr: Captured stderr from the invocation.
+            argv: The full argv that was run, for reproduction. Nothing in
+                it is a secret (the account number already lives in the
+                config file, and the real credential is the on-disk store),
+                so it is quoted for safe display, not stripped.
+        """
         self.exit_code = exit_code
         self.stderr = stderr
         self.argv = argv
 
-        redacted = " ".join(shlex.quote(a) for a in argv)
+        quoted = " ".join(shlex.quote(a) for a in argv)
         super().__init__(
-            f"signal-cli exited {exit_code}: {stderr.strip()} [{redacted}]")
+            f"signal-cli exited {exit_code}: {stderr.strip()} [{quoted}]")
 
 
 class BudgetExhausted(Exception):
@@ -147,11 +156,13 @@ class SignalConfig:
         )
 
 
-# (argv, timeout_seconds) -> (exit_code, stdout, stderr)
-Runner = Callable[[list[str], float], tuple[int, str, str]]
+# (argv, timeout_seconds) -> (exit_code, stdout, stderr). timeout is None for
+# "no limit", matching subprocess.run's own convention.
+Runner = Callable[[list[str], float | None], tuple[int, str, str]]
 
 
-def _subprocess_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
+def _subprocess_runner(
+        argv: list[str], timeout: float | None) -> tuple[int, str, str]:
     """Default Runner. Never invoked by unit tests, which inject their own."""
     completed = subprocess.run(
         argv, capture_output=True, text=True, timeout=timeout, check=False)
@@ -264,15 +275,23 @@ class SignalCli:
         Retry is bounded by the invocation deadline rather than by attempt count
         alone: two rate-limited calls backing off 60 s then 120 s would exceed
         the platform's 540 s ceiling on their own.
+
+        Attempts are tracked per exit code, not as one shared counter: a call
+        that fails SERVER_OR_IO then RATE_LIMIT must give the rate limit its
+        own first backoff (60s), not the position a different code's failures
+        left behind. Resetting the counter whenever the code changes was
+        rejected too — alternating failures would then reset each other
+        forever, leaving the deadline as the only bound. A dict caps total
+        retries at sum(len(b) for b in BACKOFFS.values()) regardless.
         """
         argv = self.argv(subcommand, *args)
-        backoff: tuple[int, ...] = ()
-        attempt = 0
+        attempts: dict[int, int] = {}
 
         while True:
             remaining = self._check_budget(f"running {subcommand}")
+            timeout = None if remaining == float("inf") else remaining
 
-            exit_code, stdout, stderr = self._run_process(argv, remaining)
+            exit_code, stdout, stderr = self._run_process(argv, timeout)
             if exit_code == int(ExitCode.SUCCESS):
                 return stdout
 
@@ -282,11 +301,12 @@ class SignalCli:
                 raise error
 
             backoff = BACKOFFS.get(exit_code, ())
+            attempt = attempts.get(exit_code, 0)
             if attempt >= len(backoff):
                 raise error
 
             wait = backoff[attempt]
-            attempt += 1
+            attempts[exit_code] = attempt + 1
 
             # Refuse to sleep past the deadline; fail now instead of being
             # killed mid-operation by the platform.
@@ -296,5 +316,5 @@ class SignalCli:
 
             logger.warning(
                 f"{subcommand} exited {exit_code} "
-                f"(attempt {attempt}/{len(backoff)}); retrying in {wait}s")
+                f"(attempt {attempt + 1}/{len(backoff)}); retrying in {wait}s")
             self._sleep(wait)

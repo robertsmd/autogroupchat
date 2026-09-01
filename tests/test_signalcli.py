@@ -2,8 +2,16 @@
 
 import pytest
 
-from autogroupchat.makers.automakesignal import SignalCli
-from tests.conftest import FakeRunner
+from autogroupchat.makers.automakesignal import (
+    BACKOFF_RATE_LIMIT,
+    BACKOFF_SERVER_OR_IO,
+    BudgetExhausted,
+    ExitCode,
+    Retry,
+    SignalCli,
+    SignalCliError,
+)
+from tests.conftest import FakeClock, FakeRunner, FakeSleeper
 
 NUMBER = "+15551234567"
 DATA_DIR = "/tmp/signal-cli"
@@ -63,17 +71,6 @@ def test_argv_rejects_a_subcommand_that_looks_like_a_flag():
 
     with pytest.raises(ValueError):
         cli.argv("-a")
-
-
-from autogroupchat.makers.automakesignal import (
-    BACKOFF_RATE_LIMIT,
-    BACKOFF_SERVER_OR_IO,
-    BudgetExhausted,
-    ExitCode,
-    Retry,
-    SignalCliError,
-)
-from tests.conftest import FakeClock, FakeSleeper
 
 
 def test_success_returns_stdout():
@@ -197,3 +194,47 @@ def test_timeout_handed_to_runner_never_exceeds_remaining_budget():
     cli.run("listGroups")
 
     assert runner.timeouts == [30.0]
+
+
+def test_backoff_index_is_per_exit_code_not_shared():
+    """
+    A SERVER_OR_IO failure followed by a RATE_LIMIT failure must give the
+    rate limit its own first backoff (60s), not whatever index the server
+    error left behind in a shared counter. A shared counter would hand this
+    rate-limit failure BACKOFF_RATE_LIMIT[1] (120s) instead of [0] (60s).
+    """
+    runner = FakeRunner()
+    runner.queue(int(ExitCode.SERVER_OR_IO), "", "server sad")
+    runner.queue(int(ExitCode.RATE_LIMIT), "", "slow down")
+    runner.queue(0, "ok")
+
+    sleeper = FakeSleeper()
+    cli = make_cli(runner, sleep=sleeper)
+
+    assert cli.run("listGroups") == "ok"
+    assert sleeper.slept == [BACKOFF_SERVER_OR_IO[0], BACKOFF_RATE_LIMIT[0]]
+
+
+def test_alternating_exit_codes_each_get_their_own_full_backoff():
+    """
+    Two SERVER_OR_IO failures followed by a RATE_LIMIT failure must still
+    attempt the rate-limit backoff rather than raise: with unlimited budget,
+    nothing should terminate a retryable call except its own backoff running
+    out. A shared attempt counter would see attempt index 2 on the third
+    call, find it >= len(BACKOFF_RATE_LIMIT) (2), and raise immediately
+    without ever sleeping the rate-limit backoff.
+    """
+    runner = FakeRunner()
+    runner.queue(int(ExitCode.SERVER_OR_IO), "", "server sad")
+    runner.queue(int(ExitCode.SERVER_OR_IO), "", "server sad")
+    runner.queue(int(ExitCode.RATE_LIMIT), "", "slow down")
+    runner.queue(0, "recovered")
+
+    sleeper = FakeSleeper()
+    cli = make_cli(runner, sleep=sleeper)
+
+    assert cli.run("listGroups") == "recovered"
+    assert len(runner.calls) == 4
+    assert sleeper.slept == [
+        BACKOFF_SERVER_OR_IO[0], BACKOFF_SERVER_OR_IO[1], BACKOFF_RATE_LIMIT[0],
+    ]
