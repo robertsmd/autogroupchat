@@ -679,6 +679,47 @@ def parse_stamp(description: str | None) -> tuple[int, datetime.date] | None:
     return (int(match.group("version")), created)
 
 
+class PurgeDecision(Enum):
+    """Why a group was or was not purged. Every value but PURGE means keep."""
+
+    PURGE = "purge"
+    NOT_OURS = "not-ours"
+    UNKNOWN_STAMP_VERSION = "unknown-stamp-version"
+    FUTURE_DATE = "future-date"
+    TOO_YOUNG = "too-young"
+    NOT_A_MEMBER = "not-a-member"
+
+
+def purge_decision(group: dict[str, Any],
+                   today: datetime.date,
+                   max_age_days: int) -> PurgeDecision:
+    """
+    Decide whether one group should be purged. Pure, so it is cheap to test.
+
+    Fail-closed by construction: every path that cannot prove the group is ours
+    and old returns a keep decision. The asymmetry is deliberate. A missed purge
+    leaves a stale group; a false positive abandons a live one.
+    """
+    if not group.get("isMember"):
+        return PurgeDecision.NOT_A_MEMBER
+
+    parsed = parse_stamp(group.get("description"))
+    if parsed is None:
+        return PurgeDecision.NOT_OURS
+
+    version, created = parsed
+    if version != STAMP_VERSION:
+        return PurgeDecision.UNKNOWN_STAMP_VERSION
+
+    if created > today:
+        return PurgeDecision.FUTURE_DATE
+
+    if (today - created) <= datetime.timedelta(days=int(max_age_days)):
+        return PurgeDecision.TOO_YOUNG
+
+    return PurgeDecision.PURGE
+
+
 class AutoMakeSignal(AutoMakeGroupChat):
     """
     Signal backend, driving signal-cli through SignalCli.
@@ -957,3 +998,97 @@ class AutoMakeSignal(AutoMakeGroupChat):
     def send_message_to_group(self, group: str, message: str) -> None:
         """Send one message to the group."""
         self.cli.send_group(group, message)
+
+    def successors_from_listing(self, listing: dict[str, Any]) -> list[str]:
+        """
+        Pick promotion candidates from an already-fetched group listing.
+
+        Pure selection logic pulled out of successors_for_leave, so
+        purge_groups can reuse the listing from its own list_groups() call
+        instead of re-fetching once per purge candidate.
+
+        Empty unless we are the only admin and somebody else remains. The pick
+        is sorted by uuid so it is reproducible rather than dependent on dict
+        order.
+        """
+        members = listing.get("members") or []
+        self_number = self.signal_config.signal_number
+
+        admins = [m for m in members if m.get("isAdmin")]
+        others = [m for m in members if m.get("number") != self_number]
+
+        we_are_sole_admin = (
+            len(admins) == 1
+            and admins[0].get("number") == self_number)
+
+        if not we_are_sole_admin or not others:
+            return []
+
+        others.sort(key=lambda m: str(m.get("uuid") or ""))
+        successor = others[0].get("number") or others[0].get("uuid")
+
+        return [successor] if successor else []
+
+    def successors_for_leave(self, group_id: str) -> list[str]:
+        """
+        Members to promote before leaving, which Signal requires of a last admin.
+
+        Fetches the listing fresh via _group_listing_or_none, returning []
+        when the read fails or the group is absent rather than guessing a
+        successor blind. If we are in fact the sole admin, signal-cli will
+        reject the quit with "You need to specify a new admin" -- the correct
+        loud failure in that case.
+        """
+        listing = self._group_listing_or_none(group_id)
+        if listing is None:
+            return []
+
+        return self.successors_from_listing(listing)
+
+    def remove_self_group(self, group: str) -> None:
+        """
+        Leave a group, promoting a successor first if we are the only admin.
+
+        This leaves rather than deletes. Signal has no destroy-group operation,
+        so the group survives for its remaining members.
+        """
+        self.cli.quit_group(group, new_admins=self.successors_for_leave(group))
+
+        logger.info(f"left Signal group {group}")
+
+    def purge_groups(self, group_delete_age_days: int = 30) -> None:
+        """
+        Leave groups this tool created more than `group_delete_age_days` ago.
+
+        Age comes from the stamp in the group description, because signal-cli
+        reports no creation timestamp. Anything unparseable is left alone and
+        logged; see purge_decision for the full fail-closed rule.
+
+        Successor selection reuses the listing already in hand from the
+        list_groups() call above via successors_from_listing, rather than
+        successors_for_leave's own re-fetch -- that would cost one redundant
+        signal-cli call per purge candidate for no benefit.
+
+        One group failing does not stop the others: a group we cannot leave
+        should not strand the whole cleanup.
+        """
+        today = self._today()
+
+        for group in self.cli.list_groups():
+            group_id = group.get("id")
+            decision = purge_decision(group, today, group_delete_age_days)
+
+            if decision is not PurgeDecision.PURGE:
+                logger.info(
+                    f"keeping group {group_id} ({group.get('name')!r}): "
+                    f"{decision.value}")
+                continue
+
+            try:
+                self.cli.quit_group(
+                    group_id, new_admins=self.successors_from_listing(group))
+                logger.info(
+                    f"purged group {group_id} ({group.get('name')!r})")
+            except SignalCliError as e:
+                logger.error(
+                    f"could not purge group {group_id}: {e.stderr.strip()}")

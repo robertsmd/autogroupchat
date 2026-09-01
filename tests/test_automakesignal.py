@@ -455,3 +455,164 @@ def test_group_by_id_returns_none_when_absent(config_file):
 
     with maker.session():
         assert maker.group_by_id("no-such-group") is None
+
+
+from autogroupchat.makers.automakesignal import PurgeDecision, purge_decision
+
+OLD = datetime.date(2026, 1, 1)
+SELF = "+15551234567"
+
+
+def listing_entry(**overrides) -> dict:
+    """One JsonGroup-shaped dict for purge_decision, defaulting to purgeable."""
+    entry = {
+        "id": "gid",
+        "name": "Old Group",
+        "description": stamp_description(MESSAGE_ALWAYS_SEND, OLD),
+        "isMember": True,
+        "members": [{"number": SELF, "uuid": "uuid-self", "isAdmin": True}],
+        "pendingMembers": [],
+    }
+    entry.update(overrides)
+
+    return entry
+
+
+def test_purge_decision_purges_a_stamped_old_group():
+    assert purge_decision(listing_entry(), TODAY, 30) is PurgeDecision.PURGE
+
+
+def test_purge_decision_keeps_a_young_group():
+    entry = listing_entry(
+        description=stamp_description(MESSAGE_ALWAYS_SEND,
+                                      TODAY - datetime.timedelta(days=5)))
+
+    assert purge_decision(entry, TODAY, 30) is PurgeDecision.TOO_YOUNG
+
+
+def test_purge_decision_keeps_a_group_exactly_at_the_age_limit():
+    """Strictly greater than, so a group is kept on its birthday boundary."""
+    entry = listing_entry(
+        description=stamp_description(MESSAGE_ALWAYS_SEND,
+                                      TODAY - datetime.timedelta(days=30)))
+
+    assert purge_decision(entry, TODAY, 30) is PurgeDecision.TOO_YOUNG
+
+
+@pytest.mark.parametrize("description", [
+    None,
+    "",
+    MESSAGE_ALWAYS_SEND,
+    "a group somebody else made",
+    "autogroupchat:1:garbage",
+])
+def test_purge_decision_keeps_anything_it_cannot_parse(description):
+    entry = listing_entry(description=description)
+
+    assert purge_decision(entry, TODAY, 30) is PurgeDecision.NOT_OURS
+
+
+def test_purge_decision_keeps_an_unknown_stamp_version():
+    """A newer format means newer code wrote it; deleting on a guess is wrong."""
+    entry = listing_entry(description="autogroupchat:99:2020-01-01 newer format")
+
+    assert purge_decision(entry, TODAY, 30) is PurgeDecision.UNKNOWN_STAMP_VERSION
+
+
+def test_purge_decision_keeps_a_future_dated_group():
+    """A future date is a clock or format bug, not an old group."""
+    entry = listing_entry(
+        description=stamp_description(MESSAGE_ALWAYS_SEND,
+                                      TODAY + datetime.timedelta(days=1)))
+
+    assert purge_decision(entry, TODAY, 30) is PurgeDecision.FUTURE_DATE
+
+
+def test_purge_decision_skips_groups_we_already_left():
+    entry = listing_entry(isMember=False)
+
+    assert purge_decision(entry, TODAY, 30) is PurgeDecision.NOT_A_MEMBER
+
+
+def test_purge_quits_only_the_purgeable_group(config_file):
+    runner = FakeRunner()
+    keep = listing_entry(id="keep", description=MESSAGE_ALWAYS_SEND)
+    purge = listing_entry(id="purge")
+    runner.queue(0, json.dumps([keep, purge]))
+    runner.queue(0, "{}")
+
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.purge_groups(group_delete_age_days=30)
+
+    quits = [c for c in runner.calls if "quitGroup" in c]
+    assert len(quits) == 1
+    assert quits[0][quits[0].index("-g") + 1] == "purge"
+    assert "--delete" in quits[0]
+
+
+def test_purge_continues_after_one_group_fails(config_file):
+    """One un-leavable group must not strand the rest of the cleanup."""
+    runner = FakeRunner()
+    runner.queue(0, json.dumps([listing_entry(id="first"),
+                                listing_entry(id="second")]))
+    runner.queue(int(ExitCode.USER_ERROR), "", "cannot leave")
+    runner.queue(0, "{}")
+
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.purge_groups(group_delete_age_days=30)
+
+    quits = [c for c in runner.calls if "quitGroup" in c]
+    assert len(quits) == 2
+
+
+def test_successors_names_a_member_when_we_are_the_only_admin(config_file):
+    runner = FakeRunner().queue(0, json.dumps([listing_entry(members=[
+        {"number": SELF, "uuid": "uuid-self", "isAdmin": True},
+        {"number": "+15559999999", "uuid": "uuid-b", "isAdmin": False},
+        {"number": "+15558888888", "uuid": "uuid-a", "isAdmin": False},
+    ])]))
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        # Sorted by uuid so the choice is reproducible, not arbitrary.
+        assert maker.successors_for_leave("gid") == ["+15558888888"]
+
+
+def test_successors_is_empty_when_another_admin_remains(config_file):
+    runner = FakeRunner().queue(0, json.dumps([listing_entry(members=[
+        {"number": SELF, "uuid": "uuid-self", "isAdmin": True},
+        {"number": "+15559999999", "uuid": "uuid-b", "isAdmin": True},
+    ])]))
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        assert maker.successors_for_leave("gid") == []
+
+
+def test_successors_is_empty_when_we_are_the_last_member(config_file):
+    runner = FakeRunner().queue(0, json.dumps([listing_entry()]))
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        assert maker.successors_for_leave("gid") == []
+
+
+def test_remove_self_designates_a_successor_admin(config_file):
+    runner = FakeRunner()
+    runner.queue(0, json.dumps([listing_entry(members=[
+        {"number": SELF, "uuid": "uuid-self", "isAdmin": True},
+        {"number": "+15559999999", "uuid": "uuid-b", "isAdmin": False},
+    ])]))
+    runner.queue(0, "{}")
+
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.remove_self_group("gid")
+
+    quit_argv = [c for c in runner.calls if "quitGroup" in c][0]
+    assert quit_argv[quit_argv.index("--admin") + 1] == "+15559999999"
