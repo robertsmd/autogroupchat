@@ -20,6 +20,12 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Any, Callable
 
+from autogroupchat.makers.signalaccountstore import (
+    AccountStore,
+    OnMissing,
+    build_store,
+)
+
 global logger
 logger = logging.getLogger(__name__)
 
@@ -542,3 +548,71 @@ class SignalCli:
             raise SignalCliError(exit_code, stderr, argv)
 
         return stdout
+
+
+class SignalSession:
+    """
+    Owns one account-store lifecycle and hands out a SignalCli bound to it.
+
+    Scoped to a whole run rather than a single command: the store is downloaded
+    once on entry and uploaded once on exit, so wrapping individual operations
+    would mean a GCS round trip per signal-cli call.
+    """
+
+    def __init__(self,
+                 config: SignalConfig,
+                 *,
+                 store: AccountStore | None = None,
+                 runner: Runner | None = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep,
+                 on_missing: OnMissing = OnMissing.ERROR) -> None:
+        """
+        Configure a session for one run, without touching the store yet.
+
+        Args:
+            config: Validated account identity and location.
+            store: Seam for the account-store backend. Tests inject a fake
+                here so no test touches a real filesystem or GCS bucket.
+                Defaults to a store built from `config.account_store`.
+            runner: Seam forwarded to the SignalCli this session yields.
+            clock: Seam for reading the current time when computing the
+                invocation deadline. Tests inject a fake here so the
+                deadline is deterministic.
+            sleep: Seam forwarded to the SignalCli this session yields.
+            on_missing: What to do when no store exists yet. Only bootstrap
+                commands (`link`, `register`) should pass EMPTY; defaulting
+                to EMPTY here would silently mask an unlinked account.
+        """
+        self.config = config
+        self.store = store or build_store(config.account_store)
+        self.on_missing = on_missing
+
+        self._runner = runner
+        self._clock = clock
+        self._sleep = sleep
+        self._cli: SignalCli | None = None
+
+    def __enter__(self) -> SignalCli:
+        """Materialise the store and start the invocation clock."""
+        data_dir = self.store.acquire(self.on_missing)
+
+        self._cli = SignalCli(
+            self.config.signal_number,
+            data_dir,
+            binary=self.config.signal_cli_path,
+            trust_new_identities=self.config.trust_new_identities,
+            deadline=self._clock() + self.config.invocation_budget_seconds,
+            runner=self._runner,
+            sleep=self._sleep,
+            clock=self._clock,
+        )
+
+        return self._cli
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Persist the store, then let any exception propagate."""
+        self.store.release(exc)
+        self._cli = None
+
+        return False
