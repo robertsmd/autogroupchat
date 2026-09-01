@@ -5,7 +5,11 @@ import logging
 import pytest
 
 from autogroupchat.makers.automakesignal import SignalConfig, SignalSession
-from autogroupchat.makers.signalaccountstore import AccountStore, OnMissing
+from autogroupchat.makers.signalaccountstore import (
+    AccountStore,
+    AccountStoreError,
+    OnMissing,
+)
 from tests.conftest import FakeClock, FakeRunner
 
 CONFIG = SignalConfig.from_dict({
@@ -139,3 +143,35 @@ def test_exit_propagates_a_release_failure_when_the_body_succeeded():
     with pytest.raises(ValueError):
         with SignalSession(CONFIG, store=store, runner=FakeRunner()):
             pass
+
+
+def test_a_failure_to_persist_the_store_fails_the_run():
+    """
+    The reason _upload raises rather than logging: a store that was not
+    persisted, on a run that otherwise succeeded, must not report success.
+    Messages already sent have advanced the recipients' ratchet state, and
+    the store that would have tracked it is gone.
+    """
+    store = ReleaseRaisingStore(
+        AccountStoreError("work dir is gone; could not be persisted"))
+
+    with pytest.raises(AccountStoreError):
+        with SignalSession(CONFIG, store=store, runner=FakeRunner()):
+            pass
+
+
+def test_a_failure_to_persist_never_masks_the_bodys_exception(caplog):
+    """
+    The other direction of the same asymmetry: raising from _upload is only
+    safe because __exit__ defers to a body exception. A send that failed must
+    still surface as the send failure, with the persist failure logged.
+    """
+    store = ReleaseRaisingStore(
+        AccountStoreError("work dir is gone; could not be persisted"))
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            with SignalSession(CONFIG, store=store, runner=FakeRunner()):
+                raise RuntimeError("send blew up")
+
+    assert "could not be persisted" in caplog.text

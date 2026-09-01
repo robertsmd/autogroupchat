@@ -399,9 +399,15 @@ class GcsStore(AccountStore):
     def _upload(self) -> None:
         """Tar the work dir and write it under an if_generation_match guard."""
         if not os.path.isdir(self.work_dir):
-            logger.error(
-                "work dir %s is gone; nothing to persist", self.work_dir)
-            return
+            # Not logged-and-returned: release() would then complete normally
+            # and the run would report success for a store that was never
+            # persisted. By this point messages may already have been sent, so
+            # the recipients' ratchet state has advanced while the store has
+            # not -- the desynchronisation this backend exists to prevent.
+            raise AccountStoreError(
+                f"work dir {self.work_dir} is gone, so the account store "
+                f"could not be persisted; any message this run sent has "
+                f"already advanced the recipients' ratchet state")
 
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             archive = tmp.name

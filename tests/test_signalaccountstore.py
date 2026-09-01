@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import stat
 import tarfile
 
@@ -480,3 +481,40 @@ def test_transfer_timeout_fits_inside_the_reserve():
     is decoration. 2 x 25 = 50 s against a 60 s reserve.
     """
     assert 2 * GCS_TRANSFER_TIMEOUT_SECONDS < 60
+
+
+def test_release_raises_when_the_work_dir_vanished(tmp_path):
+    """
+    A vanished work dir means the store was never persisted. Logging and
+    returning normally reported success for exactly that -- and by then
+    messages may already have been sent, so the recipients' ratchet state has
+    advanced while the store has not. That desynchronisation is the failure
+    this whole backend exists to avoid, so it must be loud.
+    """
+    client = FakeGcsClient()
+    seed_store(client, {"account.db": "x"})
+    store = GcsStore(gcs_config(tmp_path), client=client)
+    store.acquire()
+
+    shutil.rmtree(tmp_path / "work")
+
+    with pytest.raises(AccountStoreError) as exc:
+        store.release(None)
+
+    assert "could not be persisted" in str(exc.value)
+
+
+def test_release_frees_the_lock_when_the_work_dir_vanished(tmp_path):
+    """The store is unpersistable either way; wedging the account too is not."""
+    client = FakeGcsClient()
+    seed_store(client, {"account.db": "x"})
+    store = GcsStore(gcs_config(tmp_path), client=client)
+    store.acquire()
+
+    shutil.rmtree(tmp_path / "work")
+
+    with pytest.raises(AccountStoreError):
+        store.release(None)
+
+    assert LOCK in client.deletes
+
