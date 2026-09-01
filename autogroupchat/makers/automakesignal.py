@@ -10,6 +10,7 @@ therefore carries account *identity and location* only; moving the mutable
 store is signalaccountstore's job.
 """
 
+import json
 import logging
 import shlex
 import subprocess
@@ -73,6 +74,13 @@ BACKOFFS: dict[int, tuple[int, ...]] = {
     int(ExitCode.SERVER_OR_IO): BACKOFF_SERVER_OR_IO,
     int(ExitCode.RATE_LIMIT): BACKOFF_RATE_LIMIT,
 }
+
+
+class Delete(Enum):
+    """Whether quitGroup also discards the local copy of the group's state."""
+
+    LOCAL_DATA = "local-data"
+    KEEP_LOCAL_DATA = "keep-local-data"
 
 
 class SignalCliError(Exception):
@@ -265,6 +273,17 @@ class SignalCli:
 
         return remaining
 
+    def _timeout(self, remaining: float) -> float | None:
+        """
+        Convert remaining budget to a subprocess timeout.
+
+        `_remaining()` reports an unset deadline as float("inf"), which is not
+        a value `subprocess.run(timeout=...)` should ever see; None is its own
+        convention for "no limit". Both `run()` and `_run_bare()` funnel
+        through here so that conversion happens in exactly one place.
+        """
+        return None if remaining == float("inf") else remaining
+
     def run(self,
             subcommand: str,
             *args: str,
@@ -289,7 +308,7 @@ class SignalCli:
 
         while True:
             remaining = self._check_budget(f"running {subcommand}")
-            timeout = None if remaining == float("inf") else remaining
+            timeout = self._timeout(remaining)
 
             exit_code, stdout, stderr = self._run_process(argv, timeout)
             if exit_code == int(ExitCode.SUCCESS):
@@ -318,3 +337,145 @@ class SignalCli:
                 f"{subcommand} exited {exit_code} "
                 f"(attempt {attempt + 1}/{len(backoff)}); retrying in {wait}s")
             self._sleep(wait)
+
+    def run_json(self,
+                 subcommand: str,
+                 *args: str,
+                 retry: Retry = Retry.ENABLED) -> Any:
+        """Run a subcommand and parse its JSON output, or {} if it printed none."""
+        stdout = self.run(subcommand, *args, retry=retry)
+        if not stdout.strip():
+            return {}
+
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError as e:
+            raise SignalCliError(
+                int(ExitCode.UNEXPECTED),
+                f"could not parse {subcommand} output as JSON: {e}",
+                self.argv(subcommand, *args),
+            ) from e
+
+    def create_group(self,
+                     name: str,
+                     description: str,
+                     avatar: str | None = None) -> str:
+        """
+        Create a group and return its base64 id.
+
+        Deliberately never retried. `updateGroup` with no -g creates a new
+        group every time, so a retry after a transport error leaves an orphan
+        group behind and returns the id of the second one.
+
+        signal-cli reports groupId only when it actually created a group
+        (UpdateGroupCommand.java:213), so its absence is a hard error rather
+        than something to paper over.
+        """
+        args = ["-n", name, "-d", description]
+        if avatar:
+            # updateGroup's -a is --avatar. Safe here only because globals()
+            # already consumed the account's -a ahead of the subcommand.
+            args += ["-a", avatar]
+
+        response = self.run_json("updateGroup", *args, retry=Retry.DISABLED)
+
+        group_id = response.get("groupId")
+        if not group_id:
+            raise SignalCliError(
+                int(ExitCode.UNEXPECTED),
+                "updateGroup returned no groupId, so no group was created",
+                self.argv("updateGroup", *args),
+            )
+
+        return group_id
+
+    def update_group(self,
+                     group_id: str,
+                     *,
+                     members: list[str] = (),
+                     admins: list[str] = (),
+                     name: str | None = None,
+                     description: str | None = None) -> None:
+        """Modify an existing group. Does nothing when there is nothing to change."""
+        args: list[str] = []
+        if name:
+            args += ["-n", name]
+
+        if description:
+            args += ["-d", description]
+
+        if admins:
+            args += ["--admin", *admins]
+
+        # -m is nargs="*", so it must come last or it swallows following flags.
+        if members:
+            args += ["-m", *members]
+
+        if not args:
+            logger.debug(f"update_group({group_id}) had nothing to change")
+            return
+
+        self.run_json("updateGroup", "-g", group_id, *args)
+
+    def send_group(self, group_id: str, message: str) -> None:
+        """Send one text message to a group."""
+        self.run_json("send", "-g", group_id, "-m", message)
+
+    def list_groups(self) -> list[dict[str, Any]]:
+        """
+        Return every group this account knows about, with member detail.
+
+        Note the id key is "id" here, while updateGroup calls the same value
+        "groupId" (ListGroupsCommand.java:149 vs UpdateGroupCommand.java:214).
+        """
+        groups = self.run_json("listGroups", "-d")
+
+        return groups if isinstance(groups, list) else []
+
+    def quit_group(self,
+                   group_id: str,
+                   *,
+                   new_admins: list[str] = (),
+                   delete: Delete = Delete.LOCAL_DATA) -> None:
+        """
+        Leave a group, optionally naming successor admins.
+
+        signal-cli requires --admin when the departing account is the only
+        admin. This leaves rather than deletes: the group survives for its
+        remaining members, since Signal has no destroy-group operation.
+        """
+        args = ["-g", group_id]
+        if delete is Delete.LOCAL_DATA:
+            args.append("--delete")
+
+        if new_admins:
+            args += ["--admin", *new_admins]
+
+        self.run_json("quitGroup", *args)
+
+    def version(self) -> tuple[int, ...]:
+        """Parse the version signal-cli reports, e.g. (0, 14, 7)."""
+        stdout = self._run_bare("--version")
+        parts = stdout.strip().split()
+        if not parts:
+            raise SignalCliError(
+                int(ExitCode.UNEXPECTED), "no version reported", [self.binary])
+
+        return tuple(int(p) for p in parts[-1].split(".") if p.isdigit())
+
+    def _run_bare(self, *args: str) -> str:
+        """
+        Run the binary with no account globals, for --version and link.
+
+        `link` forbids -a entirely, and --version needs no account, so neither
+        can go through argv().
+        """
+        remaining = self._check_budget(f"running {args[0] if args else 'binary'}")
+        timeout = self._timeout(remaining)
+        argv = [self.binary, *args]
+
+        exit_code, stdout, stderr = self._run_process(argv, timeout)
+        if exit_code != int(ExitCode.SUCCESS):
+            raise SignalCliError(exit_code, stderr, argv)
+
+        return stdout
