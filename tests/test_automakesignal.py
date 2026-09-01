@@ -718,3 +718,136 @@ def test_remove_self_designates_a_successor_admin(config_file):
 
     quit_argv = [c for c in runner.calls if "quitGroup" in c][0]
     assert quit_argv[quit_argv.index("--admin") + 1] == "+15559999999"
+
+
+def test_group_startup_runs_the_whole_sequence_in_one_session(config_file):
+    """
+    Ordering matters and the store must be acquired exactly once. Two sessions
+    would mean two GCS round trips and, in the cloud, self-deadlock on the lock.
+    """
+    runner = FakeRunner()
+    runner.queue(0, json.dumps({"groupId": "gid"}))   # create
+    runner.queue(0, "{}")                             # add members
+    runner.queue(0, group_listing())                  # membership log
+    runner.queue(0, "{}")                             # add admin
+    runner.queue(0, "{}")                             # promote admin
+    runner.queue(0, "{}")                             # MESSAGE_ALWAYS_SEND
+    runner.queue(0, "{}")                             # startup message
+    runner.queue(0, json.dumps([]))                   # purge listGroups
+
+    acquisitions = []
+
+    class CountingStore(FakeStore):
+        def acquire(self, on_missing=None) -> str:
+            acquisitions.append(on_missing)
+            return self.data_dir
+
+    class Injected(AutoMakeSignal):
+        def __init__(self, path: str) -> None:
+            super().__init__(path, store=CountingStore(), runner=runner,
+                             today=lambda: TODAY, sleep=FakeSleeper())
+
+    group_id = Injected.group_startup(
+        Injected, config_file, "Test Group", dict(MEMBERS),
+        admin={"Carol": "+15557778888"},
+        startup_messages=["welcome"],
+    )
+
+    assert group_id == "gid"
+    assert len(acquisitions) == 1
+
+    order = [c[c.index("--trust-new-identities") + 2] for c in runner.calls]
+    assert order[0] == "updateGroup"
+    assert order[-1] == "listGroups"
+    assert "send" in order
+
+
+def test_group_startup_stays_in_the_group_by_default(config_file):
+    runner = FakeRunner()
+    runner.queue(0, json.dumps({"groupId": "gid"}))
+    runner.queue(0, "{}")
+    runner.queue(0, group_listing())
+    runner.queue(0, "{}")
+    runner.queue(0, "{}")
+    runner.queue(0, json.dumps([]))
+
+    class Injected(AutoMakeSignal):
+        def __init__(self, path: str) -> None:
+            super().__init__(path, store=FakeStore(), runner=runner,
+                             today=lambda: TODAY, sleep=FakeSleeper())
+
+    Injected.group_startup(
+        Injected, config_file, "Test Group", dict(MEMBERS))
+
+    assert not any("quitGroup" in c for c in runner.calls)
+
+
+def test_group_startup_leaves_when_told_to(config_file):
+    runner = FakeRunner()
+    runner.queue(0, json.dumps({"groupId": "gid"}))
+    runner.queue(0, "{}")
+    runner.queue(0, group_listing())
+    runner.queue(0, "{}")
+    runner.queue(0, "{}")
+    runner.queue(0, group_listing())   # successors_for_leave
+    runner.queue(0, "{}")              # quitGroup
+    runner.queue(0, json.dumps([]))
+
+    class Injected(AutoMakeSignal):
+        def __init__(self, path: str) -> None:
+            super().__init__(path, store=FakeStore(), runner=runner,
+                             today=lambda: TODAY, sleep=FakeSleeper())
+
+    Injected.group_startup(
+        Injected, config_file, "Test Group", dict(MEMBERS),
+        dont_leave_group=False)
+
+    assert any("quitGroup" in c for c in runner.calls)
+
+
+def test_group_startup_rejects_more_than_one_admin(config_file):
+    runner = FakeRunner()
+
+    class Injected(AutoMakeSignal):
+        def __init__(self, path: str) -> None:
+            super().__init__(path, store=FakeStore(), runner=runner,
+                             today=lambda: TODAY, sleep=FakeSleeper())
+
+    with pytest.raises(AssertionError):
+        Injected.group_startup(
+            Injected, config_file, "Test Group", {},
+            admin={"A": "+15551110000", "B": "+15552220000"})
+
+
+def test_doctor_reports_a_version_below_the_floor(config_file):
+    runner = FakeRunner().queue(0, "signal-cli 0.13.0\n")
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        problems = maker.doctor()
+
+    assert any("0.13.0" in p for p in problems)
+
+
+def test_doctor_is_silent_when_everything_checks_out(config_file):
+    runner = FakeRunner()
+    runner.queue(0, "signal-cli 0.14.7\n")
+    runner.queue(0, json.dumps([]))
+
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        assert maker.doctor() == []
+
+
+def test_doctor_reports_an_unusable_store(config_file):
+    runner = FakeRunner()
+    runner.queue(0, "signal-cli 0.14.7\n")
+    runner.queue(int(ExitCode.USER_ERROR), "", "User +15551234567 is not registered.")
+
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        problems = maker.doctor()
+
+    assert any("not registered" in p for p in problems)

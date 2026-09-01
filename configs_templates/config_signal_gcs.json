@@ -1,0 +1,14 @@
+{
+    "signal_number": "<+15551234567>",
+    "signal_cli_path": "/opt/signal-cli/signal-cli",
+    "account_store": {
+        "type": "gcs",
+        "bucket": "<state_bucket_name>",
+        "object": "signal-cli/<+15551234567>.tar.gz",
+        "lock_object": "signal-cli/<+15551234567>.lock",
+        "lock_ttl_seconds": 900,
+        "work_dir": "/tmp/signal-cli"
+    },
+    "trust_new_identities": "on-first-use",
+    "invocation_budget_seconds": 480
+}

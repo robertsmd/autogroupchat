@@ -10,13 +10,16 @@ therefore carries account *identity and location* only; moving the mutable
 store is signalaccountstore's job.
 """
 
+import argparse
 import contextlib
 import datetime
 import json
 import logging
+import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -725,6 +728,19 @@ def purge_decision(group: dict[str, Any],
     return PurgeDecision.PURGE
 
 
+def _dir_size(path: str) -> int:
+    """Total bytes under `path`, for reporting the store's real footprint."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+
+    return total
+
+
 class AutoMakeSignal(AutoMakeGroupChat):
     """
     Signal backend, driving signal-cli through SignalCli.
@@ -1140,3 +1156,237 @@ class AutoMakeSignal(AutoMakeGroupChat):
                 # must still not abort the rest of the sweep.
                 logger.error(
                     f"could not evaluate group {group_id} for purge: {e}")
+
+    def doctor(self) -> list[str]:
+        """
+        Recompute the deployment's assumptions and return every problem found.
+
+        Exists so the numbers in the design are checked rather than trusted:
+        the version floor, whether the account is actually registered, and
+        whether the store is usable at all.
+        """
+        problems: list[str] = []
+
+        try:
+            version = self.cli.version()
+            if version < SIGNAL_CLI_MIN_VERSION:
+                problems.append(
+                    f"signal-cli {'.'.join(str(p) for p in version)} is older "
+                    f"than the required "
+                    f"{'.'.join(str(p) for p in SIGNAL_CLI_MIN_VERSION)}")
+        except (SignalCliError, OSError, ValueError) as e:
+            problems.append(f"could not run {self.signal_config.signal_cli_path}: {e}")
+            return problems
+
+        try:
+            groups = self.cli.list_groups()
+            logger.info(f"account is usable; it knows about {len(groups)} groups")
+        except SignalCliError as e:
+            problems.append(f"account store is not usable: {e.stderr.strip()}")
+
+        size = _dir_size(self.cli.data_dir)
+        logger.info(
+            f"account store at {self.cli.data_dir} is {size / 1e6:.1f} MB; "
+            f"set Cloud Run --memory from this plus headroom")
+
+        return problems
+
+    def group_startup(clazz,
+                      config_file: str,
+                      group_name: str,
+                      members: dict[str, str],
+                      admin: dict[str, str] = {},
+                      startup_messages: list[str] = [],
+                      image: str = None,
+                      description: str = None,
+                      dont_leave_group: bool = True,
+                      group_delete_age_days: int = 30) -> str:
+        """
+        Signal override of AutoMakeGroupChat.group_startup.
+
+        Reimplemented rather than inherited for two reasons:
+
+        1. The whole sequence must run inside ONE account-store session. The
+           store is downloaded on entry and uploaded on exit, and the ABC gives
+           no teardown hook for a session opened in __init__. Wrapping the
+           inherited method would build a second instance and, in the cloud,
+           deadlock against the lock the first one holds.
+        2. The ordering differs. GroupMe must promote the admin before adding
+           members, because adding an existing member fails there. Signal has no
+           such constraint, so members go in first and the admin is promoted
+           afterwards, which is one fewer special case.
+
+        Not decorated @classmethod, matching the ABC's existing convention of
+        being called as `clazz.group_startup(clazz, ...)`.
+        """
+        agc = clazz(config_file)
+
+        if not description:
+            description = MESSAGE_ALWAYS_SEND
+
+        if admin:
+            assert len(admin) == 1, "Only one admin may be promoted per group."
+
+        with agc.session():
+            group = agc.create_group(group_name, image, description)
+
+            agc.add_members_group(group, members)
+
+            if admin:
+                admin_name, admin_phone_number = admin.popitem()
+                agc.add_member_group(group, admin_name, admin_phone_number)
+                agc.change_group_owner(group, admin_name, admin_phone_number)
+
+            agc.send_message_to_group(group, MESSAGE_ALWAYS_SEND)
+
+            if not startup_messages:
+                startup_messages = [f"Welcome to {group_name}. {description}"]
+
+            for message in startup_messages:
+                agc.send_message_to_group(group, message)
+
+            if not dont_leave_group:
+                agc.remove_self_group(group)
+
+            agc.purge_groups(group_delete_age_days=group_delete_age_days)
+
+        return group
+
+
+def run(args) -> None:
+    """Create one group from command-line arguments."""
+    members = {m.split(":")[0]: m.split(":")[1] for m in args.members if m}
+
+    admin = {args.admin.split(":")[0]: args.admin.split(":")[1]} \
+        if args.admin else {}
+
+    AutoMakeSignal.group_startup(
+        AutoMakeSignal,
+        args.config_file,
+        args.group_name,
+        members,
+        admin,
+        args.startup_messages,
+        args.image,
+        args.description,
+        args.dont_leave_group,
+    )
+
+
+def run_link(args) -> None:
+    """
+    Link this account as a secondary device, then persist the new store.
+
+    One-time and human-driven: the printed sgnl:// URI must be scanned from the
+    phone's Signal app. signal-cli forbids -a on `link`, so this bypasses the
+    usual globals.
+    """
+    maker = AutoMakeSignal(args.config_file)
+
+    with maker.session(on_missing=OnMissing.EMPTY) as cli:
+        logger.info("scan the URI below from Signal on your phone: "
+                    "Settings > Linked Devices > +")
+        print(cli._run_bare(
+            "--data-dir", cli.data_dir, "link", "-n", args.name))
+
+
+def run_register(args) -> None:
+    """Register a dedicated number, rather than linking to an existing phone."""
+    maker = AutoMakeSignal(args.config_file)
+
+    with maker.session(on_missing=OnMissing.EMPTY) as cli:
+        register_args = ["register"]
+        if args.voice:
+            register_args.append("--voice")
+
+        if args.captcha:
+            register_args += ["--captcha", args.captcha]
+
+        cli.run(*register_args, retry=Retry.DISABLED)
+        logger.info("registered; now run `verify` with the code you receive")
+
+
+def run_verify(args) -> None:
+    """Complete registration with the code sent by Signal."""
+    maker = AutoMakeSignal(args.config_file)
+
+    with maker.session() as cli:
+        cli.run("verify", args.code, retry=Retry.DISABLED)
+        logger.info("verified")
+
+
+def run_doctor(args) -> None:
+    """Check the deployment's assumptions; exit non-zero on any problem."""
+    maker = AutoMakeSignal(args.config_file)
+
+    with maker.session():
+        problems = maker.doctor()
+
+    for problem in problems:
+        logger.error(problem)
+
+    sys.exit(1 if problems else 0)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the module's CLI. Subcommands mirror signal-cli's own vocabulary."""
+    default_config = (
+        f"{os.path.dirname(__file__)}/../../configs/config_signal.json")
+
+    parser = argparse.ArgumentParser(
+        description="Create Signal groups with signal-cli")
+    parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument("-g", "--config-file", default=default_config,
+                        help="json configuration file specifying credentials")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    create = subparsers.add_parser("create", help="create a group")
+    create.add_argument("group_name")
+    create.add_argument("members", nargs="+",
+                        help="members as 'Name:+15551234567'")
+    create.add_argument("-a", "--admin", default="",
+                        help="member to promote to admin, as 'Name:+1555...'")
+    create.add_argument("-s", "--startup-messages", nargs="+", default=[],
+                        help="messages to send after forming the group")
+    create.add_argument("--image", default="")
+    create.add_argument("--description", default=MESSAGE_ALWAYS_SEND,
+                        help="Don't make this dynamic. Purge relies on the "
+                             "stamped prefix this becomes.")
+    create.add_argument("--dont-leave-group", action='store_true')
+    create.set_defaults(func=run)
+
+    link = subparsers.add_parser(
+        "link", help="link to an existing Signal account on your phone")
+    link.add_argument("--name", default="autogroupchat",
+                      help="device name shown in Signal's Linked Devices")
+    link.set_defaults(func=run_link)
+
+    register = subparsers.add_parser(
+        "register", help="register a dedicated number")
+    register.add_argument("--voice", action="store_true",
+                          help="verify by voice call instead of SMS")
+    register.add_argument("--captcha", default="",
+                          help="captcha token, if registration was refused")
+    register.set_defaults(func=run_register)
+
+    verify = subparsers.add_parser("verify", help="finish registration")
+    verify.add_argument("code", help="the verification code Signal sent")
+    verify.set_defaults(func=run_verify)
+
+    doctor = subparsers.add_parser(
+        "doctor", help="check the binary, account and store")
+    doctor.set_defaults(func=run_doctor)
+
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format=f'[{log_level}] %(message)s')
+    logger = logging.getLogger(__name__)
+
+    args.func(args)
+    sys.exit()
