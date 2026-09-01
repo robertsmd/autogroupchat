@@ -1,6 +1,7 @@
 """Tests for account-store backends (spec sections 4, 5, 12)."""
 
 import os
+import stat
 
 import pytest
 
@@ -55,6 +56,37 @@ def test_local_store_creates_a_missing_data_dir_when_bootstrapping(tmp_path):
 
     assert store.acquire(OnMissing.EMPTY) == str(target)
     assert target.is_dir()
+
+
+def test_local_store_creates_a_missing_data_dir_owner_only(tmp_path):
+    """
+    The data dir holds the account's identity key and ratchet state, so a
+    freshly bootstrapped one must not be group- or world-readable.
+    """
+    target = tmp_path / "fresh"
+    store = LocalStore({"type": "local", "data_dir": str(target)})
+
+    store.acquire(OnMissing.EMPTY)
+
+    mode = stat.S_IMODE(os.stat(target).st_mode)
+    assert mode == 0o700
+
+
+def test_local_store_warns_about_a_preexisting_loose_data_dir(tmp_path, caplog):
+    """
+    An operator who linked their account under a loose umask deserves to
+    know, but acquire must not chmod a directory out from under them.
+    """
+    target = tmp_path / "loose"
+    target.mkdir(mode=0o755)
+    os.chmod(target, 0o755)
+    store = LocalStore({"type": "local", "data_dir": str(target)})
+
+    with caplog.at_level("WARNING"):
+        store.acquire()
+
+    assert "755" in caplog.text
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o755
 
 
 def test_local_store_requires_data_dir_in_config():

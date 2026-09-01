@@ -11,12 +11,17 @@ Design: docs/superpowers/specs/2026-08-31-signal-maker-design.md sections 4, 12
 
 import logging
 import os
+import stat
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any
 
 global logger
 logger = logging.getLogger(__name__)
+
+# The data dir holds the account's identity key, prekeys and ratchet state.
+# Owner-only: no group or world bits.
+_SECURE_DATA_DIR_MODE = 0o700
 
 
 class AccountStoreError(Exception):
@@ -51,7 +56,7 @@ class AccountStore(ABC):
     """
 
     @abstractmethod
-    def acquire(self, on_missing: "OnMissing" = OnMissing.ERROR) -> str:
+    def acquire(self, on_missing: OnMissing = OnMissing.ERROR) -> str:
         """Return a local path holding the account's signal-cli data dir."""
 
     @abstractmethod
@@ -73,6 +78,7 @@ class LocalStore(AccountStore):
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
+        """Resolve `config["data_dir"]` to an absolute, user-expanded path."""
         data_dir = config.get("data_dir")
         if not data_dir:
             raise AccountStoreError(
@@ -83,6 +89,7 @@ class LocalStore(AccountStore):
     def acquire(self, on_missing: OnMissing = OnMissing.ERROR) -> str:
         """Verify the data dir exists, creating it only when bootstrapping."""
         if os.path.isdir(self.data_dir):
+            self._warn_if_loose_permissions()
             return self.data_dir
 
         if on_missing is OnMissing.ERROR:
@@ -90,9 +97,35 @@ class LocalStore(AccountStore):
                 f"no signal-cli data dir at {self.data_dir}; "
                 f"run the `link` command first")
 
-        os.makedirs(self.data_dir, exist_ok=True)
+        # `mode=` on makedirs is masked by the umask, so a directory born from
+        # a permissive umask can still come out group- or world-readable.
+        # exist_ok=True also means makedirs never re-chmods a dir that
+        # already exists, so chmod explicitly to be sure.
+        os.makedirs(self.data_dir, mode=_SECURE_DATA_DIR_MODE, exist_ok=True)
+        try:
+            os.chmod(self.data_dir, _SECURE_DATA_DIR_MODE)
+        except OSError:
+            logger.warning(
+                "could not set owner-only permissions on new data dir %s",
+                self.data_dir)
 
         return self.data_dir
+
+    def _warn_if_loose_permissions(self) -> None:
+        """
+        Log a warning if an existing data dir is group- or world-readable.
+
+        Never chmods it: an operator's existing directory is theirs, this
+        only tells them the identity key and ratchet state inside it are
+        exposed to other local users.
+        """
+        mode = stat.S_IMODE(os.stat(self.data_dir).st_mode)
+        if mode & ~_SECURE_DATA_DIR_MODE:
+            logger.warning(
+                "signal-cli data dir %s has mode %o, looser than the "
+                "recommended %o; it holds the account's identity key and "
+                "ratchet state",
+                self.data_dir, mode, _SECURE_DATA_DIR_MODE)
 
     def release(self, error: BaseException | None = None) -> None:
         """No-op: the store never left the persistent filesystem."""
