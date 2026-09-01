@@ -12,6 +12,7 @@ store is signalaccountstore's job.
 
 import json
 import logging
+import re
 import shlex
 import subprocess
 import time
@@ -35,6 +36,16 @@ STORE_TRANSFER_RESERVE_SECONDS = 60
 DEFAULT_INVOCATION_BUDGET_SECONDS = (
     PLATFORM_TIMEOUT_SECONDS - STORE_TRANSFER_RESERVE_SECONDS
 )
+
+# Cap on how much raw stdout gets embedded in a JSON-parse-failure message.
+# Enough to see the shape of the bad output; not derived from anything, just
+# short enough that one bad response can't flood a log line.
+RUN_JSON_ERROR_PREVIEW_CHARS = 500
+
+# A dot-separated version component's leading digit run, e.g. "7" out of
+# "7-SNAPSHOT". Components with no leading digit (a bare qualifier like
+# "rc1" preceded by its own dot) end the parse.
+VERSION_COMPONENT_RE = re.compile(r"\d+")
 
 
 class ExitCode(IntEnum):
@@ -350,9 +361,19 @@ class SignalCli:
         try:
             return json.loads(stdout)
         except json.JSONDecodeError as e:
+            # This is a client-side parse failure, not a signal-cli error
+            # exit: run() only returns here when the process exited 0, so
+            # ExitCode.SUCCESS is the real code, not a fabricated one. The
+            # raw stdout is included (truncated) so the bad output is not
+            # lost, but capped so one huge blob can't flood a log line.
+            preview = stdout[:RUN_JSON_ERROR_PREVIEW_CHARS]
+            if len(stdout) > RUN_JSON_ERROR_PREVIEW_CHARS:
+                preview += "...(truncated)"
+
             raise SignalCliError(
-                int(ExitCode.UNEXPECTED),
-                f"could not parse {subcommand} output as JSON: {e}",
+                int(ExitCode.SUCCESS),
+                f"{subcommand} exited 0 but printed unparseable JSON "
+                f"({e}): {preview!r}",
                 self.argv(subcommand, *args),
             ) from e
 
@@ -373,11 +394,20 @@ class SignalCli:
         """
         args = ["-n", name, "-d", description]
         if avatar:
-            # updateGroup's -a is --avatar. Safe here only because globals()
-            # already consumed the account's -a ahead of the subcommand.
+            # updateGroup's -a is --avatar. Safe here only because
+            # global_flags() already consumed the account's -a ahead of the
+            # subcommand.
             args += ["-a", avatar]
 
         response = self.run_json("updateGroup", *args, retry=Retry.DISABLED)
+
+        if not isinstance(response, dict):
+            raise SignalCliError(
+                int(ExitCode.SUCCESS),
+                f"updateGroup returned {type(response).__name__}, not an "
+                "object, so no groupId could be read",
+                self.argv("updateGroup", *args),
+            )
 
         group_id = response.get("groupId")
         if not group_id:
@@ -427,10 +457,27 @@ class SignalCli:
 
         Note the id key is "id" here, while updateGroup calls the same value
         "groupId" (ListGroupsCommand.java:149 vs UpdateGroupCommand.java:214).
+
+        An unexpected (non-list) shape raises rather than reading as "zero
+        groups": a silently empty listing is indistinguishable from a
+        legitimately empty account, and would make purge selection,
+        membership logging, and admin succession all silently no-op if
+        signal-cli's output shape ever changes. Empty stdout is not this
+        case: run_json already turns it into {}, which list_groups turns
+        into [] below, matching a brand-new account that has no groups.
         """
         groups = self.run_json("listGroups", "-d")
+        if groups == {}:
+            return []
 
-        return groups if isinstance(groups, list) else []
+        if not isinstance(groups, list):
+            raise SignalCliError(
+                int(ExitCode.SUCCESS),
+                f"listGroups returned {type(groups).__name__}, not a list",
+                self.argv("listGroups", "-d"),
+            )
+
+        return groups
 
     def quit_group(self,
                    group_id: str,
@@ -454,14 +501,30 @@ class SignalCli:
         self.run_json("quitGroup", *args)
 
     def version(self) -> tuple[int, ...]:
-        """Parse the version signal-cli reports, e.g. (0, 14, 7)."""
+        """
+        Parse the version signal-cli reports, e.g. (0, 14, 7).
+
+        Each dot-separated component is read for its leading digit run, so a
+        build qualifier suffixed onto the last component (e.g. "7-SNAPSHOT",
+        "0-rc1") still yields the numeric value instead of dropping the whole
+        component. Parsing stops at the first component with no leading
+        digit at all.
+        """
         stdout = self._run_bare("--version")
         parts = stdout.strip().split()
         if not parts:
             raise SignalCliError(
                 int(ExitCode.UNEXPECTED), "no version reported", [self.binary])
 
-        return tuple(int(p) for p in parts[-1].split(".") if p.isdigit())
+        numbers: list[int] = []
+        for component in parts[-1].split("."):
+            match = VERSION_COMPONENT_RE.match(component)
+            if not match:
+                break
+
+            numbers.append(int(match.group()))
+
+        return tuple(numbers)
 
     def _run_bare(self, *args: str) -> str:
         """

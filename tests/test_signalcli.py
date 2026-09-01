@@ -1,11 +1,14 @@
 """Tests for the SignalCli driver (spec sections 7, 10)."""
 
+import json
+
 import pytest
 
 from autogroupchat.makers.automakesignal import (
     BACKOFF_RATE_LIMIT,
     BACKOFF_SERVER_OR_IO,
     BudgetExhausted,
+    Delete,
     ExitCode,
     Retry,
     SignalCli,
@@ -240,10 +243,6 @@ def test_alternating_exit_codes_each_get_their_own_full_backoff():
     ]
 
 
-import json
-
-from autogroupchat.makers.automakesignal import Delete
-
 # Shape from UpdateGroupCommand.java:206-216. groupId is present ONLY when the
 # call created a new group, which is exactly the idempotency signal we need.
 CREATED_GROUP_JSON = json.dumps({
@@ -440,3 +439,85 @@ def test_version_parses_the_reported_version():
     cli = make_cli(runner)
 
     assert cli.version() == (0, 14, 7)
+
+
+def test_run_json_reports_the_real_exit_code_and_the_raw_output():
+    """
+    A parse failure is client-side: the process still exited 0. Fabricating a
+    signal-cli exit code would misinform anything keying off .exit_code, and
+    dropping the offending stdout leaves nobody able to see what signal-cli
+    actually printed.
+    """
+    runner = FakeRunner().queue(0, "not json at all")
+    cli = make_cli(runner)
+
+    with pytest.raises(SignalCliError) as exc_info:
+        cli.run_json("listGroups")
+
+    assert exc_info.value.exit_code == int(ExitCode.SUCCESS)
+    assert "not json at all" in str(exc_info.value)
+
+
+def test_run_json_truncates_a_huge_unparseable_blob():
+    """The raw output is included for diagnosis, but a huge blob must not be
+    allowed to flood a log line."""
+    runner = FakeRunner().queue(0, "x" * 10_000)
+    cli = make_cli(runner)
+
+    with pytest.raises(SignalCliError) as exc_info:
+        cli.run_json("listGroups")
+
+    assert len(str(exc_info.value)) < 1_000
+
+
+def test_list_groups_raises_on_unexpected_shape():
+    """
+    A dict shape (e.g. an error response) must not silently read as zero
+    groups: that is indistinguishable from a legitimately empty account, and
+    would make purge selection, membership logging, and admin succession all
+    silently no-op on a signal-cli output-shape change.
+    """
+    runner = FakeRunner().queue(0, json.dumps({"error": "boom"}))
+    cli = make_cli(runner)
+
+    with pytest.raises(SignalCliError):
+        cli.list_groups()
+
+
+def test_create_group_raises_when_response_is_not_a_dict():
+    """A shape change in updateGroup's output must not raise an uncontrolled
+    AttributeError from .get() on a non-dict."""
+    runner = FakeRunner().queue(0, json.dumps(["unexpected", "shape"]))
+    cli = make_cli(runner)
+
+    with pytest.raises(SignalCliError):
+        cli.create_group("Test Group", "desc")
+
+
+def test_version_parses_a_snapshot_suffix_on_the_patch_component():
+    runner = FakeRunner().queue(0, "signal-cli 0.14.7-SNAPSHOT\n")
+    cli = make_cli(runner)
+
+    assert cli.version() == (0, 14, 7)
+
+
+def test_version_stops_at_the_first_component_with_no_leading_digit():
+    runner = FakeRunner().queue(0, "signal-cli 0.14-SNAPSHOT\n")
+    cli = make_cli(runner)
+
+    assert cli.version() == (0, 14)
+
+
+def test_version_parses_a_release_candidate_suffix():
+    runner = FakeRunner().queue(0, "signal-cli 0.15.0-rc1\n")
+    cli = make_cli(runner)
+
+    assert cli.version() == (0, 15, 0)
+
+
+def test_version_raises_on_a_non_zero_exit():
+    runner = FakeRunner().queue(int(ExitCode.USER_ERROR), "", "unknown flag")
+    cli = make_cli(runner)
+
+    with pytest.raises(SignalCliError):
+        cli.version()
