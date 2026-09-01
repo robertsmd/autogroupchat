@@ -7,9 +7,11 @@ import pytest
 
 from autogroupchat.makers.automakegroupchat import MESSAGE_ALWAYS_SEND
 from autogroupchat.makers.automakesignal import (
+    BACKOFF_SERVER_OR_IO,
     STAMP_VERSION,
     AutoMakeSignal,
     ExitCode,
+    SignalCliError,
     parse_stamp,
     stamp_description,
 )
@@ -44,8 +46,16 @@ class FakeStore:
 
 
 def make_maker(config_file, runner: FakeRunner, today: datetime.date = TODAY):
+    """
+    Build a maker wired to `runner`, with a no-op sleeper.
+
+    Without a sleeper seam, a test that exhausts the SERVER_OR_IO backoff
+    (1+2+4+8 = 15s) would sleep for real; FakeSleeper records durations
+    instead.
+    """
     return AutoMakeSignal(
-        config_file, store=FakeStore(), runner=runner, today=lambda: today)
+        config_file, store=FakeStore(), runner=runner, today=lambda: today,
+        sleep=FakeSleeper())
 
 
 def test_stamp_description_uses_the_documented_grammar():
@@ -175,3 +185,162 @@ def test_shared_marker_constant_is_untouched():
     assert MESSAGE_ALWAYS_SEND == (
         "Group created by autogroupchat. "
         "Please contact s41l8hu2@duck.com with any issues.")
+
+
+MEMBERS = {"Alice": "+15551112222", "Bob": "+15553334444"}
+
+
+def group_listing(**overrides) -> str:
+    """One listGroups entry, shaped like ListGroupsCommand's JsonGroup record."""
+    group = {
+        "id": "gid",
+        "name": "Test Group",
+        "description": stamp_description(MESSAGE_ALWAYS_SEND, TODAY),
+        "isMember": True,
+        "isBlocked": False,
+        "messageExpirationTime": 0,
+        "members": [
+            {"number": "+15551234567", "uuid": "uuid-self", "isAdmin": True},
+        ],
+        "pendingMembers": [],
+        "requestingMembers": [],
+        "admins": [],
+        "banned": [],
+        "groupInviteLink": None,
+    }
+    group.update(overrides)
+
+    return json.dumps([group])
+
+
+def test_add_members_sends_one_batched_call(config_file):
+    runner = FakeRunner()
+    runner.queue(0, "{}")
+    runner.queue(0, group_listing())
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.add_members_group("gid", MEMBERS)
+
+    update = runner.calls[0]
+    assert update[update.index("-m") + 1:] == ["+15551112222", "+15553334444"]
+
+
+def test_add_members_falls_back_to_one_call_each_on_user_error(config_file):
+    """
+    signal-cli raises 'The user X is not registered.' (exit 1) for any single
+    unregistered number, which aborts the whole batch. Falling back isolates
+    the bad numbers so the good ones still land.
+    """
+    runner = FakeRunner()
+    runner.queue(int(ExitCode.USER_ERROR), "", "The user +15553334444 is not registered.")
+    runner.queue(0, "{}")
+    runner.queue(int(ExitCode.USER_ERROR), "", "The user +15553334444 is not registered.")
+    runner.queue(0, group_listing())
+
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.add_members_group("gid", MEMBERS)
+
+    per_member = [c for c in runner.calls if "-m" in c]
+    assert len(per_member) == 3
+    assert per_member[1][per_member[1].index("-m") + 1:] == ["+15551112222"]
+    assert per_member[2][per_member[2].index("-m") + 1:] == ["+15553334444"]
+
+
+def test_add_members_does_not_fall_back_on_a_transport_error(config_file):
+    """Exit 3 is retried inside SignalCli; a per-member retry storm on top of
+    that would multiply calls against the invocation budget for nothing."""
+    runner = FakeRunner()
+    for _ in range(len(BACKOFF_SERVER_OR_IO) + 1):
+        runner.queue(int(ExitCode.SERVER_OR_IO), "", "server sad")
+
+    maker = make_maker(config_file, runner)
+
+    with pytest.raises(SignalCliError):
+        with maker.session():
+            maker.add_members_group("gid", MEMBERS)
+
+
+def test_add_members_with_no_numbers_makes_no_call(config_file):
+    runner = FakeRunner()
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.add_members_group("gid", {})
+
+    assert runner.calls == []
+
+
+def test_add_members_logs_the_pending_split(config_file, caplog):
+    """
+    Members whose profile key we lack are invited, not added. Silence here would
+    read as success when nobody actually joined.
+    """
+    runner = FakeRunner()
+    runner.queue(0, "{}")
+    runner.queue(0, group_listing(
+        members=[
+            {"number": "+15551234567", "uuid": "uuid-self", "isAdmin": True},
+            {"number": "+15551112222", "uuid": "uuid-alice", "isAdmin": False},
+        ],
+        pendingMembers=[{"number": "+15553334444", "uuid": "uuid-bob"}],
+    ))
+
+    maker = make_maker(config_file, runner)
+
+    with caplog.at_level("INFO"):
+        with maker.session():
+            maker.add_members_group("gid", MEMBERS)
+
+    logged = caplog.text
+    assert "+15553334444" in logged
+    assert "pending" in logged.lower()
+
+
+def test_add_member_group_takes_the_group_first(config_file):
+    """
+    The ABC calls this as add_member_group(group, name, number) while declaring
+    (self, name, phone_number). The call site wins; see spec section 15.
+    """
+    runner = FakeRunner().queue(0, "{}")
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.add_member_group("gid", "Alice", "+15551112222")
+
+    argv = runner.last
+    assert argv[argv.index("-g") + 1] == "gid"
+    assert argv[argv.index("-m") + 1] == "+15551112222"
+
+
+def test_change_group_owner_promotes_to_admin(config_file):
+    """Signal has no owner. GV2 has a set of admins, so 'owner' means admin."""
+    runner = FakeRunner().queue(0, "{}")
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.change_group_owner("gid", "Alice", "+15551112222")
+
+    argv = runner.last
+    assert argv[argv.index("--admin") + 1] == "+15551112222"
+
+
+def test_send_message_to_group(config_file):
+    runner = FakeRunner().queue(0, "{}")
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        maker.send_message_to_group("gid", "hello everyone")
+
+    argv = runner.last
+    assert argv[argv.index("send"):] == ["send", "-g", "gid", "-m", "hello everyone"]
+
+
+def test_group_by_id_returns_none_when_absent(config_file):
+    runner = FakeRunner().queue(0, group_listing())
+    maker = make_maker(config_file, runner)
+
+    with maker.session():
+        assert maker.group_by_id("no-such-group") is None

@@ -773,3 +773,118 @@ class AutoMakeSignal(AutoMakeGroupChat):
         logger.info(f"created Signal group {group_name!r} with id {group_id}")
 
         return group_id
+
+    def add_members_group(self, group: str, members: dict[str, str]) -> None:
+        """
+        Add every member in one call, falling back to one call each on rejection.
+
+        signal-cli rejects the entire updateGroup call with exit 1 if any single
+        number is not a registered Signal user, so the batch is retried
+        per-member to isolate the bad ones. Matches AutoMakeGroupMe's tolerance
+        of partial failure: log and continue rather than abort.
+
+        The dict keys are display names. Signal has no per-group nickname -- each
+        member shows their own profile name -- so the names are log labels only.
+        """
+        numbers = [number for number in members.values() if number]
+        if not numbers:
+            logger.info(f"no members to add to group {group}")
+            return
+
+        try:
+            self.cli.update_group(group, members=numbers)
+        except SignalCliError as e:
+            if e.exit_code != int(ExitCode.USER_ERROR):
+                raise
+
+            logger.warning(
+                f"batch add of {len(numbers)} members was rejected "
+                f"({e.stderr.strip()}); retrying one at a time")
+            self._add_members_individually(group, members)
+
+        self._log_membership(group, members)
+
+    def _add_members_individually(self,
+                                  group: str,
+                                  members: dict[str, str]) -> None:
+        """Add members one by one so one bad number cannot block the rest."""
+        for name, number in members.items():
+            if not number:
+                continue
+
+            try:
+                self.cli.update_group(group, members=[number])
+            except SignalCliError as e:
+                logger.error(
+                    f"could not add {name} ({number}) to {group}: "
+                    f"{e.stderr.strip()}")
+
+    def group_by_id(self, group_id: str) -> dict[str, Any] | None:
+        """Find one group in listGroups output, or None."""
+        for group in self.cli.list_groups():
+            # listGroups spells the id "id"; updateGroup spells it "groupId".
+            if group.get("id") == group_id:
+                return group
+
+        return None
+
+    def _log_membership(self, group: str, members: dict[str, str]) -> None:
+        """
+        Report who actually joined, who was only invited, and who is absent.
+
+        Signal adds a member as *pending* when we do not hold their profile key;
+        they must accept before they are really in the group. Without this the
+        caller cannot tell a successful add from an ignored invitation.
+        """
+        listing = self.group_by_id(group)
+        if listing is None:
+            logger.warning(f"group {group} did not appear in listGroups")
+            return
+
+        joined = {m.get("number") for m in listing.get("members") or []}
+        pending = {m.get("number") for m in listing.get("pendingMembers") or []}
+
+        for name, number in members.items():
+            if number in joined:
+                logger.info(f"{name} ({number}) joined {group}")
+                continue
+
+            if number in pending:
+                logger.info(
+                    f"{name} ({number}) is pending in {group}; "
+                    f"they must accept the invitation")
+                continue
+
+            logger.error(f"{name} ({number}) is not in {group} at all")
+
+    def add_member_group(self,
+                         group: str,
+                         name: str,
+                         phone_number: str) -> None:
+        """
+        Add a single member.
+
+        Signature follows the ABC's *call site*, which passes the group first,
+        rather than its declaration, which omits it. See spec section 15.
+        """
+        self.cli.update_group(group, members=[phone_number])
+
+        logger.info(f"added {name} ({phone_number}) to {group}")
+
+    def change_group_owner(self,
+                           group: str,
+                           name: str,
+                           phone_number: str) -> None:
+        """
+        Promote a member to admin.
+
+        Signal has no owner: GV2 carries a set of admins, and we stay an admin
+        too. "Owner" is a GroupMe-ism preserved by the ABC.
+        """
+        self.cli.update_group(group, admins=[phone_number])
+
+        logger.info(f"made {name} ({phone_number}) an admin of {group}")
+
+    def send_message_to_group(self, group: str, message: str) -> None:
+        """Send one message to the group."""
+        self.cli.send_group(group, message)
