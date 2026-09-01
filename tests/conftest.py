@@ -1,5 +1,7 @@
 """Shared test doubles. No test in this suite executes signal-cli or touches GCS."""
 
+from typing import Any
+
 from autogroupchat.makers.signalaccountstore import PreconditionFailed
 
 
@@ -64,17 +66,43 @@ class FakeClock:
 
 
 class FakeGcsBlob:
-    """One object in FakeGcsClient, enforcing if_generation_match preconditions."""
+    """
+    One object in FakeGcsClient, enforcing if_generation_match preconditions.
 
-    def __init__(self, client: "FakeGcsClient", name: str) -> None:
-        """Reference the object named `name` in `client`'s in-memory store."""
+    Mirrors a real distinction in google-cloud-storage: `Bucket.blob()`
+    makes no network call and returns a Blob whose metadata -- including
+    `.generation` -- is unpopulated (None) until a round trip fills it in.
+    Only `Bucket.get_blob()` does that round trip. A blob constructed with
+    `populated=True` snapshots its generation at construction time, the
+    same way a real `get_blob()` response is a snapshot, not a live view.
+    """
+
+    def __init__(self, client: "FakeGcsClient", name: str, *,
+                 populated: bool = False) -> None:
+        """
+        Reference the object named `name` in `client`'s in-memory store.
+
+        `populated` distinguishes a `blob()` handle (metadata not fetched)
+        from a `get_blob()` result (metadata fetched once, at construction).
+        """
         self._client = client
         self.name = name
+        self._populated = populated
+        self._generation_snapshot = (
+            client.generations.get(name) if populated else None)
 
     @property
     def generation(self) -> int | None:
-        """Current generation of this object, or None if it has never been written."""
-        return self._client.generations.get(self.name)
+        """
+        Generation as of the round trip that populated this blob.
+
+        None for a `blob()` handle, exactly as it is against the real
+        client: no request was made to learn it.
+        """
+        if not self._populated:
+            return None
+
+        return self._generation_snapshot
 
     def exists(self) -> bool:
         """Whether this object currently has content."""
@@ -103,12 +131,18 @@ class FakeGcsBlob:
         self._client.writes.append(
             (self.name, if_generation_match))
 
-    def upload_from_string(self, data, if_generation_match=None, **kwargs) -> None:
+    def upload_from_string(self,
+                            data: str | bytes,
+                            if_generation_match: int | None = None,
+                            **kwargs: Any) -> None:
         """Write string or bytes `data` under the given precondition."""
         payload = data.encode() if isinstance(data, str) else data
         self._write(payload, if_generation_match)
 
-    def upload_from_filename(self, path, if_generation_match=None, **kwargs) -> None:
+    def upload_from_filename(self,
+                              path: str,
+                              if_generation_match: int | None = None,
+                              **kwargs: Any) -> None:
         """Write the contents of the file at `path` under the given precondition."""
         with open(path, "rb") as f:
             self._write(f.read(), if_generation_match)
@@ -120,12 +154,12 @@ class FakeGcsBlob:
 
         return self._client.objects[self.name]
 
-    def download_to_filename(self, path) -> None:
+    def download_to_filename(self, path: str) -> None:
         """Write this object's content to the file at `path`."""
         with open(path, "wb") as f:
             f.write(self.download_as_bytes())
 
-    def delete(self, **kwargs) -> None:
+    def delete(self, **kwargs: Any) -> None:
         """
         Remove this object and its generation record.
 
@@ -147,8 +181,27 @@ class FakeGcsBucket:
         self._client = client
 
     def blob(self, name: str) -> FakeGcsBlob:
-        """Return a handle to the object named `name`."""
+        """
+        Return an unpopulated handle to the object named `name`.
+
+        No network call, matching the real client: `.generation` on the
+        result is None until something (`get_blob()`, `reload()`) fetches
+        metadata.
+        """
         return FakeGcsBlob(self._client, name)
+
+    def get_blob(self, name: str) -> FakeGcsBlob | None:
+        """
+        One round trip: a populated blob, or None if `name` does not exist.
+
+        Mirrors `google.cloud.storage.Bucket.get_blob`, which is the only
+        supported way to learn an object's generation without a separate
+        `reload()` call.
+        """
+        if name not in self._client.objects:
+            return None
+
+        return FakeGcsBlob(self._client, name, populated=True)
 
 
 class FakeGcsClient:

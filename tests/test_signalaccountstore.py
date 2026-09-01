@@ -16,7 +16,7 @@ from autogroupchat.makers.signalaccountstore import (
     PreconditionFailed,
     build_store,
 )
-from tests.conftest import FakeGcsClient
+from tests.conftest import FakeGcsBlob, FakeGcsClient
 
 
 def test_local_store_returns_the_configured_data_dir(tmp_path):
@@ -251,6 +251,49 @@ def test_acquire_breaks_an_expired_lock(tmp_path):
     assert LOCK in client.deletes
 
 
+def test_acquire_breaks_a_lock_with_a_malformed_payload(tmp_path):
+    """
+    A genuinely corrupt lock payload is a real self-healing path, distinct
+    from a transport failure: there is no expiry to trust, so treating it
+    as expired is the only sane option.
+    """
+    client = FakeGcsClient()
+    seed_store(client, {"account.db": "x"})
+    client.objects[LOCK] = b"not valid json"
+    client.generations[LOCK] = 1
+
+    store = GcsStore(gcs_config(tmp_path), client=client)
+
+    store.acquire()
+
+    assert LOCK in client.deletes
+
+
+def test_acquire_propagates_a_lock_read_failure_without_breaking_it(tmp_path, monkeypatch):
+    """
+    A network failure while reading the lock's payload is not the same as
+    a malformed payload: we do not know whether the lock is live, so it
+    must not be read as expired. Breaking it anyway would be the exact
+    concurrency violation the lock exists to prevent.
+    """
+    client = FakeGcsClient()
+    seed_store(client, {"account.db": "x"})
+    client.objects[LOCK] = json.dumps({"expires_at": 5_000.0}).encode()
+    client.generations[LOCK] = 1
+
+    def _boom(self) -> bytes:
+        raise ConnectionError("simulated transport failure")
+
+    monkeypatch.setattr(FakeGcsBlob, "download_as_bytes", _boom)
+
+    store = GcsStore(gcs_config(tmp_path), client=client, clock=lambda: 9_000.0)
+
+    with pytest.raises(ConnectionError):
+        store.acquire()
+
+    assert LOCK not in client.deletes
+
+
 def test_acquire_errors_when_no_store_exists(tmp_path):
     client = FakeGcsClient()
     store = GcsStore(gcs_config(tmp_path), client=client)
@@ -279,6 +322,30 @@ def test_release_uploads_with_the_generation_it_downloaded(tmp_path):
     assert (OBJECT, 7) in client.writes
 
 
+def test_release_upload_precondition_is_the_real_downloaded_generation(tmp_path):
+    """
+    Regression: acquire() must read the generation from a single populated
+    round trip (bucket.get_blob()), not from an unpopulated blob() handle.
+
+    Against the real client, blob() makes no network call, so its
+    .generation is always None. Uploading with if_generation_match=None
+    carries no precondition at all -- an unconditional overwrite -- which
+    is exactly the failure mode the generation guard exists to prevent.
+    FakeGcsBlob.generation being computed from client state regardless of
+    how the blob was obtained is what let this pass unnoticed the first
+    time; the explicit "not None" assertion below is what catches it.
+    """
+    client = FakeGcsClient()
+    seed_store(client, {"account.db": "x"})
+    store = GcsStore(gcs_config(tmp_path), client=client)
+
+    store.acquire()
+    store.release(None)
+
+    assert (OBJECT, 7) in client.writes
+    assert (OBJECT, None) not in client.writes
+
+
 def test_release_uploads_generation_zero_for_a_fresh_store(tmp_path):
     client = FakeGcsClient()
     store = GcsStore(gcs_config(tmp_path), client=client)
@@ -304,6 +371,31 @@ def test_uploaded_tarball_round_trips(tmp_path):
     store2.acquire()
 
     assert (second_dir / "account.db").read_text() == "mutated by signal-cli"
+
+
+def test_uploaded_tarball_round_trips_nested_directories(tmp_path):
+    """
+    A real signal-cli store has subdirectories (data/, attachments/,
+    avatars/), unlike every flat seed_store() tarball above. Cover that a
+    nested path survives acquire -> mutate -> release -> acquire, not just
+    a single top-level file.
+    """
+    client = FakeGcsClient()
+    seed_store(client, {"data/account.db": "original", "avatars/group.png": "img"})
+    store = GcsStore(gcs_config(tmp_path), client=client)
+
+    store.acquire()
+    (tmp_path / "work" / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "work" / "data" / "account.db").write_text("mutated by signal-cli")
+    store.release(None)
+
+    second_dir = tmp_path / "second"
+    store2 = GcsStore(
+        {**gcs_config(tmp_path), "work_dir": str(second_dir)}, client=client)
+    store2.acquire()
+
+    assert (second_dir / "data" / "account.db").read_text() == "mutated by signal-cli"
+    assert (second_dir / "avatars" / "group.png").read_text() == "img"
 
 
 def test_release_persists_even_when_the_session_failed(tmp_path):

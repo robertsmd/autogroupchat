@@ -277,12 +277,26 @@ class GcsStore(AccountStore):
         self._locked = True
 
     def _lock_expiry(self, blob: Any) -> float:
-        """Read a lock's expiry, treating an unreadable lock as expired."""
+        """
+        Read a lock's expiry, treating a malformed payload as expired.
+
+        Only errors that mean "the payload itself is corrupt" are caught
+        here: that is a real self-healing path (see `_take_lock`, which
+        breaks a lock read as expired). A transport failure while
+        downloading the lock is a different situation entirely -- we do
+        not know whether the lock is live, so it must not be read as
+        expired. Catching it here would break a lock we cannot prove is
+        dead, which is the exact concurrency violation this design exists
+        to prevent. Such errors propagate and abort `acquire`.
+        """
         try:
-            return float(json.loads(blob.download_as_bytes())["expires_at"])
-        except Exception:
+            payload = json.loads(blob.download_as_bytes())
+            return float(payload["expires_at"])
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError,
+                TypeError, ValueError):
             logger.warning(
-                "lock %s is unreadable; treating it as expired", self.lock_name)
+                "lock %s payload is malformed; treating it as expired",
+                self.lock_name)
             return 0.0
 
     def _free_lock(self) -> None:
@@ -318,8 +332,13 @@ class GcsStore(AccountStore):
             os.makedirs(self.work_dir, mode=_SECURE_DATA_DIR_MODE, exist_ok=True)
             _secure_directory(self.work_dir)
 
-            blob = self._bucket().blob(self.object_name)
-            if not blob.exists():
+            # get_blob() is one round trip that returns a fully populated
+            # Blob (generation included) or None. blob()+.exists() would
+            # not do: blob() never talks to the server, so .generation on
+            # it is always None -- silently turning the upload's precondition
+            # into "no precondition", i.e. an unconditional overwrite.
+            blob = self._bucket().get_blob(self.object_name)
+            if blob is None:
                 if on_missing is OnMissing.ERROR:
                     raise AccountStoreError(
                         f"no account store at gs://{self.bucket_name}/"
