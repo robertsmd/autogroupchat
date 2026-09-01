@@ -11,9 +11,11 @@ store is signalaccountstore's job.
 """
 
 import logging
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass
+from enum import Enum, IntEnum
 from typing import Any, Callable
 
 global logger
@@ -32,6 +34,67 @@ STORE_TRANSFER_RESERVE_SECONDS = 60
 DEFAULT_INVOCATION_BUDGET_SECONDS = (
     PLATFORM_TIMEOUT_SECONDS - STORE_TRANSFER_RESERVE_SECONDS
 )
+
+
+class ExitCode(IntEnum):
+    """
+    signal-cli's documented exit codes.
+
+    Source: signal-cli(1) "Exit codes". These drive the retry policy directly,
+    so no error-string matching is needed to decide whether to retry.
+    """
+
+    SUCCESS = 0
+    USER_ERROR = 1
+    UNEXPECTED = 2
+    SERVER_OR_IO = 3
+    UNTRUSTED_KEY = 4
+    RATE_LIMIT = 5
+    CAPTCHA_REJECTED = 6
+
+
+class Retry(Enum):
+    """Whether an operation may be attempted more than once."""
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+
+
+# Matches AutoMakeGroupMe's min(2 ** attempt, 8) so both backends behave alike.
+BACKOFF_SERVER_OR_IO = (1, 2, 4, 8)
+
+# PROVISIONAL, not derived. signal-cli surfaces no Retry-After through its exit
+# code, so there is nothing to measure yet (spec section 16, item 3). If rate
+# limiting turns out to be routine, the documented fix is the signal-cli
+# `submitRateLimitChallenge` command rather than longer sleeps here.
+BACKOFF_RATE_LIMIT = (60, 120)
+
+BACKOFFS: dict[int, tuple[int, ...]] = {
+    int(ExitCode.SERVER_OR_IO): BACKOFF_SERVER_OR_IO,
+    int(ExitCode.RATE_LIMIT): BACKOFF_RATE_LIMIT,
+}
+
+
+class SignalCliError(Exception):
+    """A signal-cli invocation exited non-zero."""
+
+    def __init__(self, exit_code: int, stderr: str, argv: list[str]) -> None:
+        self.exit_code = exit_code
+        self.stderr = stderr
+        self.argv = argv
+
+        redacted = " ".join(shlex.quote(a) for a in argv)
+        super().__init__(
+            f"signal-cli exited {exit_code}: {stderr.strip()} [{redacted}]")
+
+
+class BudgetExhausted(Exception):
+    """
+    The invocation's wall-clock budget ran out.
+
+    Raised instead of starting work we cannot finish, so the run fails inside
+    its own budget rather than being killed mid-write by the platform.
+    """
 
 
 class SignalConfigError(Exception):
@@ -115,6 +178,28 @@ class SignalCli:
                  runner: Runner | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic) -> None:
+        """
+        Configure a driver for one signal-cli account.
+
+        Args:
+            number: The +E164 account number, sent as the global -a flag.
+            data_dir: signal-cli's data directory for this account.
+            binary: Path to the signal-cli executable.
+            trust_new_identities: Value for --trust-new-identities.
+            deadline: Absolute wall-clock cutoff on the same scale as
+                `clock()`, or None for no limit. `run` refuses to start a
+                subprocess or a backoff sleep once this passes, so retries
+                fail inside their own budget instead of being killed mid-
+                operation by the platform.
+            runner: Seam for the subprocess call: (argv, timeout) ->
+                (exit_code, stdout, stderr). Tests inject a fake here so the
+                real binary is never executed.
+            sleep: Seam for backoff waits. Tests inject a fake here so no
+                test actually sleeps.
+            clock: Seam for reading the current time against `deadline`.
+                Tests inject a fake here so retry-budget tests run without
+                real elapsed time.
+        """
         self.number = number
         self.data_dir = data_dir
         self.binary = binary
@@ -125,7 +210,7 @@ class SignalCli:
         self._sleep = sleep
         self._clock = clock
 
-    def globals(self) -> list[str]:
+    def global_flags(self) -> list[str]:
         """
         Flags that precede every subcommand.
 
@@ -151,4 +236,65 @@ class SignalCli:
             raise ValueError(
                 f"subcommand must not look like a flag: {subcommand!r}")
 
-        return [self.binary, *self.globals(), subcommand, *[str(a) for a in args]]
+        return [self.binary, *self.global_flags(), subcommand, *[str(a) for a in args]]
+
+    def _remaining(self) -> float:
+        """Seconds left before the invocation deadline, or infinity if unset."""
+        if self.deadline is None:
+            return float("inf")
+
+        return self.deadline - self._clock()
+
+    def _check_budget(self, about_to: str) -> float:
+        """Raise unless there is budget left; return the remaining seconds."""
+        remaining = self._remaining()
+        if remaining <= 0:
+            raise BudgetExhausted(
+                f"invocation budget exhausted before {about_to}")
+
+        return remaining
+
+    def run(self,
+            subcommand: str,
+            *args: str,
+            retry: Retry = Retry.ENABLED) -> str:
+        """
+        Invoke signal-cli once, retrying only on codes that can succeed later.
+
+        Retry is bounded by the invocation deadline rather than by attempt count
+        alone: two rate-limited calls backing off 60 s then 120 s would exceed
+        the platform's 540 s ceiling on their own.
+        """
+        argv = self.argv(subcommand, *args)
+        backoff: tuple[int, ...] = ()
+        attempt = 0
+
+        while True:
+            remaining = self._check_budget(f"running {subcommand}")
+
+            exit_code, stdout, stderr = self._run_process(argv, remaining)
+            if exit_code == int(ExitCode.SUCCESS):
+                return stdout
+
+            error = SignalCliError(exit_code, stderr, argv)
+
+            if retry is Retry.DISABLED:
+                raise error
+
+            backoff = BACKOFFS.get(exit_code, ())
+            if attempt >= len(backoff):
+                raise error
+
+            wait = backoff[attempt]
+            attempt += 1
+
+            # Refuse to sleep past the deadline; fail now instead of being
+            # killed mid-operation by the platform.
+            if wait >= self._check_budget(f"backing off before {subcommand}"):
+                raise BudgetExhausted(
+                    f"{wait}s backoff for {subcommand} exceeds remaining budget")
+
+            logger.warning(
+                f"{subcommand} exited {exit_code} "
+                f"(attempt {attempt}/{len(backoff)}); retrying in {wait}s")
+            self._sleep(wait)
