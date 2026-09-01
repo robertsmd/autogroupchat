@@ -191,11 +191,26 @@ gcloud run deploy autogroupchat-signal \
 - `--timeout 540` is the Cloud Run 2nd-gen event-driven ceiling. The config's `invocation_budget_seconds` defaults to 480 (540 minus 60 s reserved for downloading and uploading the store), so the maker fails cleanly inside its own budget instead of being killed mid-write by the platform.
 - `--memory 1Gi` is **provisional**, not derived. `/tmp` is tmpfs, so the extracted account store counts against memory. Run `doctor` (above) once the account is linked, and set `--memory` from what it reports the store weighs plus headroom -- do not deploy on this guess alone.
 
-**3. The Eventarc trigger**, on the existing Cloud Scheduler Pub/Sub topic: point its destination at the new `autogroupchat-signal` Cloud Run service instead of the GroupMe Cloud Function. Nothing about the schedule or the topic changes from the GroupMe setup described above.
+**3. Supplying the runtime config.** The image deliberately contains no `configs/` -- the `COPY` list in `deploy/signal/Dockerfile` names `autogroupchat`, `setup.py` and `main.py` only, which is what actually keeps credentials out of every layer. Nothing here fixes itself by adding `COPY configs`: `config_googleapi.json` is a Google service-account key, and baking it into an image layer puts it wherever pull access reaches. But `main.py` still needs, at invocation time:
+
+- the top-level scraper config named by `$AUTOGROUPCHAT_CONFIG` (default `configs/config_googlesheets_signal.json`)
+- the two paths read out of *that* file's own contents -- `api_config` (`configs/config_googleapi.json`) and `group_creation_config` (`configs/config_signal.json`)
+
+`AUTOGROUPCHAT_CONFIG` only relocates the first file. The other two are opened by the relative path written inside it, resolved against the container's working directory (`/app`) -- so they must still land at `/app/configs/` unless the operator's own top-level config is edited to use absolute paths instead.
+
+Mount all three as files via Cloud Run's Secret Manager secret-volume support, not `--set-env-vars` and not a baked-in `COPY`. The shape is roughly the flag below, added to the `gcloud run deploy` call above -- **unverified**: `gcloud` is not available in this environment, so this was not run, and the exact flag syntax must be checked against the current Cloud Run docs before use:
+
+```bash
+# UNVERIFIED -- shape only, not run. Check `gcloud run deploy --help` /
+# current Cloud Run docs for the exact secret-volume flag syntax.
+--set-secrets=/app/configs/config_googlesheets_signal.json=googlesheets-signal-config:latest,/app/configs/config_googleapi.json=googleapi-sa-key:latest,/app/configs/config_signal.json=signal-config:latest
+```
+
+**4. The Eventarc trigger**, on the existing Cloud Scheduler Pub/Sub topic: point its destination at the new `autogroupchat-signal` Cloud Run service instead of the GroupMe Cloud Function. Nothing about the schedule or the topic changes from the GroupMe setup described above.
 
 functions-framework is started with `--signature-type=event` (see the `CMD` in `deploy/signal/Dockerfile`), which adapts Eventarc's CloudEvent payload into the legacy `autogroupchat_pubsub(event, context)` handler unchanged -- confirmed by running the built container and observing the adapted call reach the handler.
 
-**4. Uploading the linked store, once**, after running `link` locally -- the account cannot be linked from inside the container; linking needs a human scanning a QR code:
+**5. Uploading the linked store, once**, after running `link` locally -- the account cannot be linked from inside the container; linking needs a human scanning a QR code:
 
 ```bash
 tar -czf store.tar.gz -C <local_data_dir> .
