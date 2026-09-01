@@ -1,0 +1,22 @@
+# Consulted by BuildKit for `docker build -f deploy/signal/Dockerfile .`
+# (BuildKit checks `<dockerfile-path>.dockerignore` before falling back to
+# the context root's `.dockerignore`). A plain `.dockerignore` placed next
+# to the Dockerfile in this directory is NOT read for that build command,
+# because the build context is the repo root, not deploy/signal/ -- verified
+# empirically; see the Dockerfile's COPY block for the load-bearing guard.
+#
+# configs/ is listed below as defence in depth and to shrink the context
+# sent to the daemon. It is NOT what actually keeps configs/ out of the
+# image: the Dockerfile's COPY list only names autogroupchat/, setup.py,
+# requirements.txt, and main.py, so configs/ never enters a layer even if
+# this file is ignored entirely (e.g. under a legacy non-BuildKit builder,
+# where it has no effect and COPY carries the guarantee alone -- the
+# verified-safe state this image was built and checked under).
+
+.git
+docs
+tests
+assets
+__pycache__
+*.pyc
+configs

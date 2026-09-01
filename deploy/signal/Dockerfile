@@ -34,6 +34,11 @@ WORKDIR /app
 COPY deploy/signal/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# This explicit COPY list -- not Dockerfile.dockerignore -- is what actually
+# keeps configs/ (credentials) out of every image layer: nothing here names
+# configs/, so it can never be copied in, regardless of ignore-file behaviour
+# or builder. Dockerfile.dockerignore is defence in depth and a smaller
+# build context, not the load-bearing guarantee.
 COPY autogroupchat ./autogroupchat
 COPY setup.py ./setup.py
 COPY deploy/signal/main.py ./main.py
