@@ -740,7 +740,8 @@ class AutoMakeSignal(AutoMakeGroupChat):
                  store: AccountStore | None = None,
                  runner: Runner | None = None,
                  today: Callable[[], datetime.date] = datetime.date.today,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         """
         Configure a Signal maker; opens no session and touches no store yet.
 
@@ -757,6 +758,11 @@ class AutoMakeSignal(AutoMakeGroupChat):
                 Tests inject a fake here so no test sleeps in real time; a
                 retry-exhaustion test would otherwise fall back to the real
                 time.sleep and wait out the full backoff.
+            clock: Seam for the invocation deadline's start time, forwarded to
+                SignalSession. Tests inject a fake here so budget-exhaustion
+                behaviour (e.g. purge_groups letting BudgetExhausted escape
+                rather than swallowing it as a per-group failure) is
+                deterministic instead of depending on real elapsed time.
         """
         super(AutoMakeSignal, self).__init__(config_file)
 
@@ -765,6 +771,7 @@ class AutoMakeSignal(AutoMakeGroupChat):
         self._runner = runner
         self._today = today
         self._sleep = sleep
+        self._clock = clock
         self._cli: SignalCli | None = None
 
     @contextlib.contextmanager
@@ -779,6 +786,7 @@ class AutoMakeSignal(AutoMakeGroupChat):
             store=self._store,
             runner=self._runner,
             sleep=self._sleep,
+            clock=self._clock,
             on_missing=on_missing,
         )
 
@@ -1084,6 +1092,15 @@ class AutoMakeSignal(AutoMakeGroupChat):
         group instead of aborting the sweep. purge_groups runs at the tail of
         group_startup, so an abort here would silently skip the rest of that
         sweep's cleanup with nothing to retry it.
+
+        BudgetExhausted is the one exception this tolerance does not cover.
+        It is a run-level condition, not a per-group one -- its whole purpose
+        is to stop work cleanly inside our own invocation budget rather than
+        be killed mid-write by the platform. Logging it as "could not
+        evaluate this group" and continuing would convert "we ran out of
+        time" into a silently successful return, with the caller never
+        learning the run did not finish. It is re-raised ahead of the
+        catch-all below rather than swallowed with everything else.
         """
         today = self._today()
 
@@ -1113,6 +1130,10 @@ class AutoMakeSignal(AutoMakeGroupChat):
             except SignalCliError as e:
                 logger.error(
                     f"could not purge group {group_id}: {e.stderr.strip()}")
+            except BudgetExhausted:
+                # Run-level, not per-group: let it escape rather than log a
+                # misleading per-group failure and report the sweep as done.
+                raise
             except Exception as e:
                 # Safety net for failure modes neither purge_decision's own
                 # guards nor this loop's callers anticipated -- one bad group

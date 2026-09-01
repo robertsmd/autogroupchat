@@ -10,12 +10,13 @@ from autogroupchat.makers.automakesignal import (
     BACKOFF_SERVER_OR_IO,
     STAMP_VERSION,
     AutoMakeSignal,
+    BudgetExhausted,
     ExitCode,
     SignalCliError,
     parse_stamp,
     stamp_description,
 )
-from tests.conftest import FakeRunner, FakeSleeper
+from tests.conftest import FakeClock, FakeRunner, FakeSleeper
 
 TODAY = datetime.date(2026, 8, 31)
 
@@ -574,6 +575,54 @@ def test_purge_continues_after_one_group_fails(config_file):
 
     quits = [c for c in runner.calls if "quitGroup" in c]
     assert len(quits) == 2
+
+
+def test_purge_groups_lets_budget_exhaustion_escape(tmp_path):
+    """
+    Review finding: BudgetExhausted is a run-level condition, not a per-group
+    one -- its whole purpose is to stop work cleanly inside our own
+    invocation budget rather than be killed mid-write by the platform.
+    Without the re-raise ahead of the catch-all guard, a run that ran out of
+    time logged one misleading "could not evaluate" line per remaining group
+    and then returned normally, reporting success for a sweep that never
+    finished.
+
+    Needs its own config (a small invocation_budget_seconds) and its own
+    clock seam, so this test builds its own config file and AutoMakeSignal
+    rather than using the config_file fixture / make_maker helper.
+    """
+    config_path = tmp_path / "config_signal.json"
+    config_path.write_text(json.dumps({
+        **CONFIG_JSON,
+        "invocation_budget_seconds": 100,
+    }))
+
+    clock = FakeClock(now=0.0)
+    fake = FakeRunner()
+    fake.queue(0, json.dumps([listing_entry(id="g1"), listing_entry(id="g2"),
+                             listing_entry(id="g3")]))
+    fake.queue(0, "{}")  # g1's quitGroup succeeds
+
+    def runner(argv: list[str], timeout: float | None):
+        result = fake(argv, timeout)
+        if "quitGroup" in argv:
+            # Simulate the clock advancing well past the budget once the
+            # first group's quit has actually gone out over the wire --
+            # the next group's budget check must now see it as exhausted.
+            clock.advance(1000.0)
+        return result
+
+    maker = AutoMakeSignal(
+        str(config_path), store=FakeStore(), runner=runner,
+        today=lambda: TODAY, sleep=FakeSleeper(), clock=clock)
+
+    with pytest.raises(BudgetExhausted):
+        with maker.session():
+            maker.purge_groups(group_delete_age_days=30)
+
+    quits = [c for c in fake.calls if "quitGroup" in c]
+    assert len(quits) == 1
+    assert quits[0][quits[0].index("-g") + 1] == "g1"
 
 
 def test_purge_continues_past_a_malformed_entry(config_file):
