@@ -11,8 +11,10 @@ store is signalaccountstore's job.
 """
 
 import logging
+import subprocess
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 global logger
 logger = logging.getLogger(__name__)
@@ -80,3 +82,73 @@ class SignalConfig:
             invocation_budget_seconds=int(config.get(
                 "invocation_budget_seconds", DEFAULT_INVOCATION_BUDGET_SECONDS)),
         )
+
+
+# (argv, timeout_seconds) -> (exit_code, stdout, stderr)
+Runner = Callable[[list[str], float], tuple[int, str, str]]
+
+
+def _subprocess_runner(argv: list[str], timeout: float) -> tuple[int, str, str]:
+    """Default Runner. Never invoked by unit tests, which inject their own."""
+    completed = subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, check=False)
+
+    return (completed.returncode, completed.stdout, completed.stderr)
+
+
+class SignalCli:
+    """
+    Thin driver over the signal-cli binary.
+
+    Speaks signal-cli's vocabulary only: it knows about groups, members and
+    admins as command-line arguments, not about "owners" or purge policy. It is
+    handed an already-materialised data dir and never moves credential state.
+    """
+
+    def __init__(self,
+                 number: str,
+                 data_dir: str,
+                 *,
+                 binary: str = DEFAULT_SIGNAL_CLI_PATH,
+                 trust_new_identities: str = DEFAULT_TRUST_NEW_IDENTITIES,
+                 deadline: float | None = None,
+                 runner: Runner | None = None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.number = number
+        self.data_dir = data_dir
+        self.binary = binary
+        self.trust_new_identities = trust_new_identities
+        self.deadline = deadline
+
+        self._run_process = runner or _subprocess_runner
+        self._sleep = sleep
+        self._clock = clock
+
+    def globals(self) -> list[str]:
+        """
+        Flags that precede every subcommand.
+
+        --data-dir is always explicit rather than inherited from
+        $XDG_DATA_HOME: the cloud path materialises the store elsewhere, and an
+        implicit default would silently operate on an empty account.
+        """
+        return [
+            "--output=json",
+            "-a", self.number,
+            "--data-dir", self.data_dir,
+            "--trust-new-identities", self.trust_new_identities,
+        ]
+
+    def argv(self, subcommand: str, *args: str) -> list[str]:
+        """
+        Build a full argv with globals guaranteed ahead of the subcommand.
+
+        Callers cannot get the ordering wrong, which matters because global -a
+        means --account while updateGroup's -a means --avatar.
+        """
+        if subcommand.startswith("-"):
+            raise ValueError(
+                f"subcommand must not look like a flag: {subcommand!r}")
+
+        return [self.binary, *self.globals(), subcommand, *[str(a) for a in args]]
