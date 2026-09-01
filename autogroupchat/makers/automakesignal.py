@@ -1164,6 +1164,14 @@ class AutoMakeSignal(AutoMakeGroupChat):
         Exists so the numbers in the design are checked rather than trusted:
         the version floor, whether the account is actually registered, and
         whether the store is usable at all.
+
+        "Every problem in one run" holds only once the binary is actually
+        invocable. A version below the floor is a problem that does not stop
+        the rest of the checks -- it is appended and the store check still
+        runs. A version() call that raises outright (the binary is missing or
+        unusable) returns immediately instead: list_groups() would fail the
+        same way for the same underlying reason, and reporting that as a
+        second, seemingly independent problem would mislead rather than help.
         """
         problems: list[str] = []
 
@@ -1218,6 +1226,11 @@ class AutoMakeSignal(AutoMakeGroupChat):
 
         Not decorated @classmethod, matching the ABC's existing convention of
         being called as `clazz.group_startup(clazz, ...)`.
+
+        `admin`, when non-empty, is emptied by `.popitem()` -- inherited from
+        the base class's own behaviour, not introduced here. A caller that
+        reuses one `admin` dict across several `group_startup` calls will
+        find promotion silently skipped from the second group onward.
         """
         agc = clazz(config_file)
 
@@ -1253,7 +1266,7 @@ class AutoMakeSignal(AutoMakeGroupChat):
         return group
 
 
-def run(args) -> None:
+def run(args: argparse.Namespace) -> None:
     """Create one group from command-line arguments."""
     members = {m.split(":")[0]: m.split(":")[1] for m in args.members if m}
 
@@ -1273,7 +1286,7 @@ def run(args) -> None:
     )
 
 
-def run_link(args) -> None:
+def run_link(args: argparse.Namespace) -> None:
     """
     Link this account as a secondary device, then persist the new store.
 
@@ -1290,7 +1303,7 @@ def run_link(args) -> None:
             "--data-dir", cli.data_dir, "link", "-n", args.name))
 
 
-def run_register(args) -> None:
+def run_register(args: argparse.Namespace) -> None:
     """Register a dedicated number, rather than linking to an existing phone."""
     maker = AutoMakeSignal(args.config_file)
 
@@ -1306,7 +1319,7 @@ def run_register(args) -> None:
         logger.info("registered; now run `verify` with the code you receive")
 
 
-def run_verify(args) -> None:
+def run_verify(args: argparse.Namespace) -> None:
     """Complete registration with the code sent by Signal."""
     maker = AutoMakeSignal(args.config_file)
 
@@ -1315,7 +1328,7 @@ def run_verify(args) -> None:
         logger.info("verified")
 
 
-def run_doctor(args) -> None:
+def run_doctor(args: argparse.Namespace) -> None:
     """Check the deployment's assumptions; exit non-zero on any problem."""
     maker = AutoMakeSignal(args.config_file)
 

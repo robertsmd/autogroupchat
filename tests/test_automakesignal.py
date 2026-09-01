@@ -1,10 +1,13 @@
 """Tests for the AutoMakeSignal maker (spec sections 8, 9)."""
 
+import argparse
+import contextlib
 import datetime
 import json
 
 import pytest
 
+from autogroupchat.makers import automakesignal
 from autogroupchat.makers.automakegroupchat import MESSAGE_ALWAYS_SEND
 from autogroupchat.makers.automakesignal import (
     BACKOFF_SERVER_OR_IO,
@@ -761,6 +764,22 @@ def test_group_startup_runs_the_whole_sequence_in_one_session(config_file):
     assert order[-1] == "listGroups"
     assert "send" in order
 
+    # The loose checks above hold under either ordering (create always runs
+    # first, purge always runs last, and a send always happens somewhere) --
+    # none of them would catch a regression to GroupMe's ordering, where the
+    # admin is promoted BEFORE members are added. Pin the one thing this
+    # task's design section says must differ: every member-add call (an
+    # updateGroup carrying -m) precedes every admin-promote call (an
+    # updateGroup carrying --admin).
+    member_add_indices = [
+        i for i, c in enumerate(runner.calls) if "updateGroup" in c and "-m" in c]
+    admin_promote_indices = [
+        i for i, c in enumerate(runner.calls) if "updateGroup" in c and "--admin" in c]
+
+    assert member_add_indices, "expected at least one member-add call"
+    assert admin_promote_indices, "expected an admin-promote call"
+    assert max(member_add_indices) < min(admin_promote_indices)
+
 
 def test_group_startup_stays_in_the_group_by_default(config_file):
     runner = FakeRunner()
@@ -851,3 +870,49 @@ def test_doctor_reports_an_unusable_store(config_file):
         problems = maker.doctor()
 
     assert any("not registered" in p for p in problems)
+
+
+def _fake_automakesignal_for_doctor(problems: list[str]):
+    """
+    A stand-in for the module-level `AutoMakeSignal` name, so run_doctor's
+    exit code can be tested without constructing a real maker -- which would
+    otherwise build a real account store from the config file's "type" and
+    touch the filesystem, something no test in this suite does.
+    """
+
+    class _FakeMaker:
+        def __init__(self, config_file: str) -> None:
+            """Ignore the config file; this fake never reads it."""
+
+        @contextlib.contextmanager
+        def session(self):
+            """No-op session -- run_doctor only needs the context manager shape."""
+            yield None
+
+        def doctor(self) -> list[str]:
+            """Return the problems this test wants run_doctor to see."""
+            return problems
+
+    return _FakeMaker
+
+
+def test_run_doctor_exits_zero_when_clean(monkeypatch, config_file):
+    monkeypatch.setattr(automakesignal, "AutoMakeSignal",
+                        _fake_automakesignal_for_doctor([]))
+    args = argparse.Namespace(config_file=config_file)
+
+    with pytest.raises(SystemExit) as excinfo:
+        automakesignal.run_doctor(args)
+
+    assert excinfo.value.code == 0
+
+
+def test_run_doctor_exits_one_when_problems_found(config_file, monkeypatch):
+    monkeypatch.setattr(automakesignal, "AutoMakeSignal",
+                        _fake_automakesignal_for_doctor(["signal-cli too old"]))
+    args = argparse.Namespace(config_file=config_file)
+
+    with pytest.raises(SystemExit) as excinfo:
+        automakesignal.run_doctor(args)
+
+    assert excinfo.value.code == 1
