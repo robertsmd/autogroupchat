@@ -10,6 +10,8 @@ therefore carries account *identity and location* only; moving the mutable
 store is signalaccountstore's job.
 """
 
+import contextlib
+import datetime
 import json
 import logging
 import re
@@ -19,8 +21,12 @@ import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from types import TracebackType
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
+from autogroupchat.makers.automakegroupchat import (
+    MESSAGE_ALWAYS_SEND,
+    AutoMakeGroupChat,
+)
 from autogroupchat.makers.signalaccountstore import (
     AccountStore,
     OnMissing,
@@ -634,3 +640,136 @@ class SignalSession:
                 exc, release_error, exc_info=release_error)
 
         return False
+
+
+STAMP_PREFIX = "autogroupchat"
+STAMP_VERSION = 1
+
+# listGroups reports no creation timestamp, so the creation date rides in the
+# group description. Anchored at the start and versioned so the format can
+# change later without stranding groups already created under version 1.
+STAMP_RE = re.compile(
+    rf"^{STAMP_PREFIX}:(?P<version>\d+):(?P<created>\d{{4}}-\d{{2}}-\d{{2}})\b")
+
+
+def stamp_description(description: str, created: datetime.date) -> str:
+    """Prefix a description with the machine-readable creation stamp."""
+    return f"{STAMP_PREFIX}:{STAMP_VERSION}:{created.isoformat()} - {description}"
+
+
+def parse_stamp(description: str | None) -> tuple[int, datetime.date] | None:
+    """
+    Read the stamp from a group description, or None when it is not ours.
+
+    Returns the version even when unrecognised, so the caller can log "unknown
+    stamp version" rather than silently treating a future format as foreign.
+    """
+    if not description:
+        return None
+
+    match = STAMP_RE.match(description)
+    if not match:
+        return None
+
+    try:
+        created = datetime.date.fromisoformat(match.group("created"))
+    except ValueError:
+        return None
+
+    return (int(match.group("version")), created)
+
+
+class AutoMakeSignal(AutoMakeGroupChat):
+    """
+    Signal backend, driving signal-cli through SignalCli.
+
+    The `group` handle passed between the ABC's methods is the base64 group id
+    string, where the GroupMe backend passes a Group object. The ABC treats it
+    as opaque, so this costs nothing.
+    """
+
+    def __init__(self,
+                 config_file: str,
+                 *,
+                 store: AccountStore | None = None,
+                 runner: Runner | None = None,
+                 today: Callable[[], datetime.date] = datetime.date.today,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
+        """
+        Configure a Signal maker; opens no session and touches no store yet.
+
+        Args:
+            config_file: Path to configs/config_signal.json.
+            store: Seam for the account-store backend, forwarded to
+                SignalSession. Tests inject a fake here so no test touches
+                a real filesystem or GCS bucket.
+            runner: Seam for the subprocess call, forwarded to SignalSession.
+                Tests inject a fake here so the real binary is never run.
+            today: Seam for the purge stamp's creation date. Tests inject a
+                fixed date here so stamped descriptions are deterministic.
+            sleep: Seam for retry backoff waits, forwarded to SignalSession.
+                Tests inject a fake here so no test sleeps in real time; a
+                retry-exhaustion test would otherwise fall back to the real
+                time.sleep and wait out the full backoff.
+        """
+        super(AutoMakeSignal, self).__init__(config_file)
+
+        self.signal_config = SignalConfig.from_dict(self.config)
+        self._store = store
+        self._runner = runner
+        self._today = today
+        self._sleep = sleep
+        self._cli: SignalCli | None = None
+
+    @contextlib.contextmanager
+    def session(self, on_missing: OnMissing = OnMissing.ERROR) -> Iterator[SignalCli]:
+        """
+        Hold one account-store session for the duration of the block.
+
+        Every operation below reads `self.cli`, which only exists inside here.
+        """
+        session = SignalSession(
+            self.signal_config,
+            store=self._store,
+            runner=self._runner,
+            sleep=self._sleep,
+            on_missing=on_missing,
+        )
+
+        with session as cli:
+            self._cli = cli
+            try:
+                yield cli
+            finally:
+                self._cli = None
+
+    @property
+    def cli(self) -> SignalCli:
+        """The active driver, or a loud error when no session is open."""
+        if self._cli is None:
+            raise RuntimeError(
+                "no signal-cli session is open; "
+                "wrap this call in `with maker.session():`")
+
+        return self._cli
+
+    def create_group(self,
+                     group_name: str,
+                     image: str,
+                     description: str) -> str:
+        """
+        Create a group and return its base64 id.
+
+        The description is always stamped, including when the caller supplied
+        its own: purge reads the creation date back out of it, so an unstamped
+        group could never be cleaned up.
+        """
+        body = description or MESSAGE_ALWAYS_SEND
+        stamped = stamp_description(body, self._today())
+
+        group_id = self.cli.create_group(
+            group_name, stamped, avatar=image or None)
+
+        logger.info(f"created Signal group {group_name!r} with id {group_id}")
+
+        return group_id
