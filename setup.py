@@ -1,8 +1,8 @@
 from setuptools import setup, find_packages
 
 VERSION = '0.3.0'
-DESCRIPTION = 'a package for automation of creation of GroupMe groups'
-LONG_DESCRIPTION = 'Scrape data from Google Sheets to get info on how to create groups, then create them using GroupMe API.'
+DESCRIPTION = 'a package for automation of group chat creation'
+LONG_DESCRIPTION = 'Scrape data from Google Sheets to get info on how to create groups, then create them using the GroupMe or Signal backend.'
 
 with open('requirements.txt') as f:
     requirements = f.read().splitlines()
@@ -18,8 +18,12 @@ setup(
     long_description=LONG_DESCRIPTION,
     packages=find_packages(),
     install_requires=requirements,
+    extras_require={
+        'signal-gcs': ['google-cloud-storage'],
+        'dev': ['pytest'],
+    },
 
-    keywords=['GroupMe', 'Google Sheets',
+    keywords=['GroupMe', 'Signal', 'Google Sheets',
               "Group Chat", "Messaging", "Automation"],
     classifiers=[
         "Programming Language :: Python :: 3",
