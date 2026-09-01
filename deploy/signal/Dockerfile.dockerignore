@@ -17,6 +17,6 @@
 docs
 tests
 assets
-__pycache__
-*.pyc
+**/__pycache__
+**/*.pyc
 configs

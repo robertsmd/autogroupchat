@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+from typing import Any
 
 from autogroupchat.scrapers.autoscrapegooglesheets import scrape_using_dict
 
@@ -25,13 +26,15 @@ def get_config(conf_file: str) -> dict:
         return json.load(f)
 
 
-def autogroupchat_pubsub(event, context) -> None:
+def autogroupchat_pubsub(event: dict[str, Any], context: Any) -> None:
     """
     Triggered by a Pub/Sub message via Eventarc.
 
     Args:
         event: event payload; `data` is base64-encoded.
-        context: event metadata.
+        context: event metadata. functions-framework's legacy context
+            object has no clean public type, so `Any` is used honestly
+            rather than inventing one.
     """
     message = base64.b64decode(event["data"]).decode("utf-8")
 
