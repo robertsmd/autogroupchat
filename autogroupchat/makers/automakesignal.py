@@ -64,6 +64,59 @@ RUN_JSON_ERROR_PREVIEW_CHARS = 500
 VERSION_COMPONENT_RE = re.compile(r"\d+")
 
 
+class InvocationDeadline:
+    """
+    The single wall-clock cutoff every session in one invocation shares.
+
+    The platform ceiling is per *invocation*, but AutoScrapeGroup.create_groups
+    calls group_startup once per group and each call builds its own maker and
+    its own session. A deadline anchored per session would therefore hand N
+    groups N x 480 s of budget under one 540 s ceiling: group 1 spends 400 s in
+    legitimate backoff inside its own budget, group 2 starts at t=400 with a
+    brand-new 480 s deadline, and Cloud Run kills it at t=540 mid-operation --
+    precisely the send-then-no-upload window the budget exists to prevent
+    (spec section 12).
+
+    Latched on first use and resettable rather than fixed at import: Cloud Run
+    reuses a warm container across invocations, so an import-time anchor would
+    be minutes stale by the second invocation and every session in it would
+    start already out of budget -- worse than the per-session anchor it
+    replaces. The request handler calls `reset()` at each invocation boundary;
+    a one-shot CLI run never needs to, because first use is its start.
+    """
+
+    def __init__(self) -> None:
+        """Create an un-anchored invocation; the first `at` call anchors it."""
+        self._started_at: float | None = None
+
+    def reset(self) -> None:
+        """
+        Un-anchor, so the next `at` call starts a fresh invocation.
+
+        Called at each invocation boundary by the request handler.
+        """
+        self._started_at = None
+
+    def at(self, budget_seconds: float,
+           clock: Callable[[], float]) -> float:
+        """
+        Deadline for `budget_seconds`, anchoring the invocation if unstarted.
+
+        The clock is the caller's rather than one held here, so the anchor and
+        the SignalCli that measures itself against the resulting deadline can
+        never end up reading two different clocks.
+        """
+        if self._started_at is None:
+            self._started_at = clock()
+
+        return self._started_at + budget_seconds
+
+
+# Shared by every session in this process unless one is injected. Module-level
+# because the invocation, not the session, is what the platform times out.
+INVOCATION_DEADLINE = InvocationDeadline()
+
+
 class ExitCode(IntEnum):
     """
     signal-cli's documented exit codes.
@@ -663,6 +716,7 @@ class SignalSession:
                  runner: Runner | None = None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
+                 invocation: InvocationDeadline | None = None,
                  on_missing: OnMissing = OnMissing.ERROR) -> None:
         """
         Configure a session for one run, without touching the store yet.
@@ -673,10 +727,14 @@ class SignalSession:
                 here so no test touches a real filesystem or GCS bucket.
                 Defaults to a store built from `config.account_store`.
             runner: Seam forwarded to the SignalCli this session yields.
-            clock: Seam for reading the current time when computing the
-                invocation deadline. Tests inject a fake here so the
-                deadline is deterministic.
+            clock: Seam forwarded to the SignalCli this session yields, for
+                reading the current time against the deadline. Tests inject
+                a fake here so budget checks are deterministic.
             sleep: Seam forwarded to the SignalCli this session yields.
+            invocation: The deadline anchor shared with every other session
+                in this invocation. Defaults to the module-level one, which
+                is what makes N groups in one Pub/Sub invocation share a
+                single budget rather than getting one each.
             on_missing: What to do when no store exists yet. Only bootstrap
                 commands (`link`, `register`) should pass EMPTY; defaulting
                 to EMPTY here would silently mask an unlinked account.
@@ -688,9 +746,10 @@ class SignalSession:
         self._runner = runner
         self._clock = clock
         self._sleep = sleep
+        self._invocation = invocation or INVOCATION_DEADLINE
 
     def __enter__(self) -> SignalCli:
-        """Materialise the store and start the invocation clock."""
+        """Materialise the store and read the invocation's shared deadline."""
         data_dir = self.store.acquire(self.on_missing)
 
         return SignalCli(
@@ -698,7 +757,8 @@ class SignalSession:
             data_dir,
             binary=self.config.signal_cli_path,
             trust_new_identities=self.config.trust_new_identities,
-            deadline=self._clock() + self.config.invocation_budget_seconds,
+            deadline=self._invocation.at(
+                self.config.invocation_budget_seconds, self._clock),
             runner=self._runner,
             sleep=self._sleep,
             clock=self._clock,
@@ -844,7 +904,8 @@ class AutoMakeSignal(AutoMakeGroupChat):
                  runner: Runner | None = None,
                  today: Callable[[], datetime.date] = datetime.date.today,
                  sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 invocation: InvocationDeadline | None = None) -> None:
         """
         Configure a Signal maker; opens no session and touches no store yet.
 
@@ -861,11 +922,16 @@ class AutoMakeSignal(AutoMakeGroupChat):
                 Tests inject a fake here so no test sleeps in real time; a
                 retry-exhaustion test would otherwise fall back to the real
                 time.sleep and wait out the full backoff.
-            clock: Seam for the invocation deadline's start time, forwarded to
-                SignalSession. Tests inject a fake here so budget-exhaustion
-                behaviour (e.g. purge_groups letting BudgetExhausted escape
-                rather than swallowing it as a per-group failure) is
-                deterministic instead of depending on real elapsed time.
+            clock: Seam for reading the current time against the deadline,
+                forwarded to SignalSession. Tests inject a fake here so
+                budget-exhaustion behaviour (e.g. purge_groups letting
+                BudgetExhausted escape rather than swallowing it as a
+                per-group failure) is deterministic instead of depending on
+                real elapsed time.
+            invocation: Seam for the deadline anchor shared across every
+                session in this invocation, forwarded to SignalSession.
+                Tests inject one here to assert that a second group does not
+                get a second full budget.
         """
         super(AutoMakeSignal, self).__init__(config_file)
 
@@ -875,6 +941,7 @@ class AutoMakeSignal(AutoMakeGroupChat):
         self._today = today
         self._sleep = sleep
         self._clock = clock
+        self._invocation = invocation
         self._cli: SignalCli | None = None
 
     @contextlib.contextmanager
@@ -890,6 +957,7 @@ class AutoMakeSignal(AutoMakeGroupChat):
             runner=self._runner,
             sleep=self._sleep,
             clock=self._clock,
+            invocation=self._invocation,
             on_missing=on_missing,
         )
 

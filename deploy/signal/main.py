@@ -12,6 +12,7 @@ import logging
 import os
 from typing import Any
 
+from autogroupchat.makers.automakesignal import INVOCATION_DEADLINE
 from autogroupchat.scrapers.autoscrapegooglesheets import scrape_using_dict
 
 DEFAULT_CONFIG = "configs/config_googlesheets_signal.json"
@@ -36,6 +37,11 @@ def autogroupchat_pubsub(event: dict[str, Any], context: Any) -> None:
             object has no clean public type, so `Any` is used honestly
             rather than inventing one.
     """
+    # A warm container keeps the previous invocation's deadline anchor, which
+    # would be minutes stale here; every session in this invocation shares the
+    # one armed now. See automakesignal.InvocationDeadline.
+    INVOCATION_DEADLINE.reset()
+
     message = base64.b64decode(event["data"]).decode("utf-8")
 
     config = get_config(os.environ.get("AUTOGROUPCHAT_CONFIG", DEFAULT_CONFIG))

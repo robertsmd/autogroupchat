@@ -916,3 +916,111 @@ def test_run_doctor_exits_one_when_problems_found(config_file, monkeypatch):
         automakesignal.run_doctor(args)
 
     assert excinfo.value.code == 1
+
+
+def queue_one_bare_group(runner: FakeRunner) -> None:
+    """
+    Queue the six calls one no-admin group_startup makes.
+
+    create, member batch, membership re-read, MESSAGE_ALWAYS_SEND, the startup
+    message, then purge's listGroups. Only the first needs real output.
+    """
+    runner.queue(0, json.dumps({"groupId": "gid"}))
+    runner.queue(0, "{}")
+    runner.queue(0, json.dumps([]))
+    runner.queue(0, "{}")
+    runner.queue(0, "{}")
+    runner.queue(0, json.dumps([]))
+
+
+def test_group_startup_shares_one_invocation_deadline(config_file):
+    """
+    AutoScrapeGroup.create_groups calls group_startup once per group, and each
+    call builds a fresh maker and a fresh session. A deadline anchored per
+    session hands N groups N x 480 s of budget under one 540 s platform
+    ceiling: group 1 spends 400 s in legitimate backoff inside its own budget,
+    group 2 starts at t=400 with a brand-new 480 s deadline and is killed by
+    Cloud Run at t=540 -- mid-operation, which is precisely the
+    send-then-no-upload window the budget exists to prevent (spec section 12).
+    """
+    clock = FakeClock(now=1_000.0)
+    invocation = automakesignal.InvocationDeadline()
+    runner = FakeRunner()
+    deadlines: list[float] = []
+
+    class Injected(AutoMakeSignal):
+        """Records the deadline its session handed this group_startup call."""
+
+        def __init__(self, path: str) -> None:
+            super().__init__(path, store=FakeStore(), runner=runner,
+                             today=lambda: TODAY, sleep=FakeSleeper(),
+                             clock=clock, invocation=invocation)
+
+        def create_group(self, group_name: str, image: str,
+                         description: str) -> str:
+            deadlines.append(self.cli.deadline)
+            return super().create_group(group_name, image, description)
+
+    queue_one_bare_group(runner)
+    queue_one_bare_group(runner)
+
+    Injected.group_startup(Injected, config_file, "First", dict(MEMBERS))
+
+    # Group 1 legitimately spent 400 s of the 480 s budget on backoff.
+    clock.advance(400.0)
+
+    Injected.group_startup(Injected, config_file, "Second", dict(MEMBERS))
+
+    assert len(deadlines) == 2
+    assert deadlines[1] == deadlines[0], (
+        "the second group's deadline moved forward, so the two groups got "
+        "two full budgets under one platform ceiling")
+
+
+def test_a_single_group_run_still_gets_its_whole_budget(config_file):
+    """
+    The invocation anchor must not shorten the one case that was already
+    correct: with one group, the deadline is still start + budget.
+    """
+    clock = FakeClock(now=1_000.0)
+    invocation = automakesignal.InvocationDeadline()
+    runner = FakeRunner()
+    deadlines: list[float] = []
+
+    class Injected(AutoMakeSignal):
+        """Records the deadline its session handed this group_startup call."""
+
+        def __init__(self, path: str) -> None:
+            super().__init__(path, store=FakeStore(), runner=runner,
+                             today=lambda: TODAY, sleep=FakeSleeper(),
+                             clock=clock, invocation=invocation)
+
+        def create_group(self, group_name: str, image: str,
+                         description: str) -> str:
+            deadlines.append(self.cli.deadline)
+            return super().create_group(group_name, image, description)
+
+    queue_one_bare_group(runner)
+
+    Injected.group_startup(Injected, config_file, "Only", dict(MEMBERS))
+
+    assert deadlines == [
+        1_000.0 + automakesignal.DEFAULT_INVOCATION_BUDGET_SECONDS]
+
+
+def test_invocation_deadline_rearms_for_a_warm_container():
+    """
+    Cloud Run reuses a warm container across invocations. An anchor latched
+    once and never re-armed would be minutes stale by the second invocation,
+    so every session in it would start already out of budget -- worse than the
+    per-session anchor it replaces. start() is what the request handler calls.
+    """
+    clock = FakeClock(now=1_000.0)
+    invocation = automakesignal.InvocationDeadline()
+
+    assert invocation.at(480, clock) == 1_480.0
+
+    clock.advance(3_600.0)
+    invocation.reset()
+
+    assert invocation.at(480, clock) == 5_080.0

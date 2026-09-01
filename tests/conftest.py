@@ -3,7 +3,28 @@
 import subprocess
 from typing import Any, Callable, Iterator
 
+import pytest
+
+from autogroupchat.makers import automakesignal
 from autogroupchat.makers.signalaccountstore import PreconditionFailed
+
+
+@pytest.fixture(autouse=True)
+def fresh_invocation_deadline() -> Iterator[None]:
+    """
+    Un-anchor the process-wide invocation deadline around every test.
+
+    The anchor is shared on purpose -- that is what stops N groups in one
+    invocation getting N budgets -- but the sharing must not cross test
+    boundaries: one test's invocation start would otherwise become the next
+    test's, and every deadline assertion after the first would be measured
+    from the wrong instant.
+    """
+    automakesignal.INVOCATION_DEADLINE.reset()
+
+    yield
+
+    automakesignal.INVOCATION_DEADLINE.reset()
 
 
 class _QueuedTimeout:
