@@ -107,3 +107,24 @@ def test_build_store_rejects_an_unknown_backend():
         build_store({"type": "carrier-pigeon"})
 
     assert "carrier-pigeon" in str(exc.value)
+
+
+def test_local_store_tightens_a_preexisting_loose_data_dir_when_bootstrapping(tmp_path, caplog):
+    """
+    `link` is about to write a brand-new identity key into this directory, so
+    permissions must be tightened before that happens -- regardless of
+    whether the directory already existed. This is the realistic case: an
+    operator's own `mkdir -p` before linking leaves it at whatever the umask
+    allows.
+    """
+    target = tmp_path / "loose"
+    target.mkdir(mode=0o755)
+    os.chmod(target, 0o755)
+    store = LocalStore({"type": "local", "data_dir": str(target)})
+
+    with caplog.at_level("WARNING"):
+        store.acquire(OnMissing.EMPTY)
+
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o700
+    assert "755" in caplog.text
+    assert "700" in caplog.text

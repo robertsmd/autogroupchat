@@ -89,7 +89,16 @@ class LocalStore(AccountStore):
     def acquire(self, on_missing: OnMissing = OnMissing.ERROR) -> str:
         """Verify the data dir exists, creating it only when bootstrapping."""
         if os.path.isdir(self.data_dir):
-            self._warn_if_loose_permissions()
+            # EMPTY means `link` is about to write a brand-new identity key
+            # here, so permissions must be tightened before that happens,
+            # regardless of whose directory this already was. ERROR means
+            # the store already exists and whatever it holds was written
+            # under its current permissions already; report, don't rewrite.
+            if on_missing is OnMissing.EMPTY:
+                self._secure_permissions()
+            else:
+                self._warn_if_loose_permissions()
+
             return self.data_dir
 
         if on_missing is OnMissing.ERROR:
@@ -99,17 +108,37 @@ class LocalStore(AccountStore):
 
         # `mode=` on makedirs is masked by the umask, so a directory born from
         # a permissive umask can still come out group- or world-readable.
-        # exist_ok=True also means makedirs never re-chmods a dir that
-        # already exists, so chmod explicitly to be sure.
         os.makedirs(self.data_dir, mode=_SECURE_DATA_DIR_MODE, exist_ok=True)
+        self._secure_permissions()
+
+        return self.data_dir
+
+    def _secure_permissions(self) -> None:
+        """
+        Chmod the data dir to owner-only, logging if that tightens it.
+
+        Bootstrap-only (`OnMissing.EMPTY`): the account's identity key is
+        about to be written here, so this runs unconditionally, whether the
+        directory was just created or already existed under looser bits.
+        """
+        try:
+            before = stat.S_IMODE(os.stat(self.data_dir).st_mode)
+        except OSError:
+            before = None
+
         try:
             os.chmod(self.data_dir, _SECURE_DATA_DIR_MODE)
         except OSError:
             logger.warning(
-                "could not set owner-only permissions on new data dir %s",
+                "could not set owner-only permissions on data dir %s",
                 self.data_dir)
+            return
 
-        return self.data_dir
+        if before is not None and before != _SECURE_DATA_DIR_MODE:
+            logger.warning(
+                "tightened signal-cli data dir %s permissions from %o to "
+                "%o before writing the account identity key",
+                self.data_dir, before, _SECURE_DATA_DIR_MODE)
 
     def _warn_if_loose_permissions(self) -> None:
         """
