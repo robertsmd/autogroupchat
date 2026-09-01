@@ -62,7 +62,7 @@ Authentication is module specific, but is intended to be provided in a `json` co
 
 1. **Prerequisite.** [signal-cli](https://github.com/AsamK/signal-cli) v0.14.7 or newer. Use the native (GraalVM) build, not the JRE build: it needs no JRE at all, and is the version `deploy/signal/Dockerfile` bakes into the Cloud Run image.
 
-2. **Credentials are not a token.** GroupMe authenticates with a static bearer token dropped in a config file. Signal has no such thing. A signal-cli credential is a *mutable* data directory holding the account's identity key, prekeys and per-recipient ratchet state, backed by a WAL-mode SQLite database. `config_signal.json` therefore carries account *identity and location* only (`signal_number`, `account_store`); the store itself is created once by a human, via `link` or `register`+`verify`, and never by an automated run.
+2. **Credentials are not a token.** GroupMe authenticates with a static bearer token dropped in a config file. Signal has no such thing. A signal-cli credential is a *mutable* data directory holding the account's identity key, prekeys and per-recipient ratchet state, backed by a WAL-mode SQLite database. `config_signal.json` therefore carries account *identity and location* only (`signal_number`, `account_store`); the store itself is created once by a human, via `link` or `register`+`verify`, and never by an automated run. Both the local and cloud paths chmod the extracted store directory to `0700` -- it holds the account's identity private key.
 
 3. **Bootstrap.** Link this tool as a secondary device on an existing phone number (or use `register`/`verify` instead, for a dedicated number), then check the result:
 
