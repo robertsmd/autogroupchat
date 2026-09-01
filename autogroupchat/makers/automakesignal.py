@@ -18,6 +18,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from types import TracebackType
 from typing import Any, Callable
 
 from autogroupchat.makers.signalaccountstore import (
@@ -591,13 +592,12 @@ class SignalSession:
         self._runner = runner
         self._clock = clock
         self._sleep = sleep
-        self._cli: SignalCli | None = None
 
     def __enter__(self) -> SignalCli:
         """Materialise the store and start the invocation clock."""
         data_dir = self.store.acquire(self.on_missing)
 
-        self._cli = SignalCli(
+        return SignalCli(
             self.config.signal_number,
             data_dir,
             binary=self.config.signal_cli_path,
@@ -608,11 +608,29 @@ class SignalSession:
             clock=self._clock,
         )
 
-        return self._cli
+    def __exit__(self,
+                 exc_type: type[BaseException] | None,
+                 exc: BaseException | None,
+                 tb: TracebackType | None) -> bool:
+        """
+        Persist the store, then let the more informative exception propagate.
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        """Persist the store, then let any exception propagate."""
-        self.store.release(exc)
-        self._cli = None
+        A release failure while the body already failed is logged rather than
+        raised: the body's exception is what a caller's `except
+        <SpecificType>` was written to catch, and letting release() replace
+        it would break that catchability. A release failure with no body
+        exception has nothing more informative to defer to, so it must
+        propagate -- swallowing it would report success for a run that
+        failed to persist the credential store.
+        """
+        try:
+            self.store.release(exc)
+        except Exception as release_error:
+            if exc is None:
+                raise
+
+            logger.error(
+                "store release failed while handling %r: %s",
+                exc, release_error, exc_info=release_error)
 
         return False
