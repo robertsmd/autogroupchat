@@ -388,8 +388,9 @@ class GcsStore(AccountStore):
 
         Uploads even when `error` is set: anything already sent has advanced
         recipients' ratchet state, so rolling the store back would desynchronise
-        it. On a generation mismatch the local copy is deliberately left in
-        place for manual recovery rather than clobbering another writer.
+        it. On a generation mismatch nothing is clobbered and recovery comes
+        from the bucket's own object versions, which is what README's recovery
+        section documents; the discarded container's local copy is no route.
         """
         try:
             self._upload()
@@ -426,7 +427,11 @@ class GcsStore(AccountStore):
                 raise AccountStoreError(
                     f"gs://{self.bucket_name}/{self.object_name} changed under "
                     f"us (expected generation {self._generation}); refusing to "
-                    f"overwrite. The local copy is preserved at {self.work_dir}"
+                    f"overwrite. Recover from the bucket's object versions: "
+                    f"`gsutil ls -a gs://{self.bucket_name}/"
+                    f"{self.object_name}`. (The local copy at {self.work_dir} "
+                    f"is also usable, but only from this host -- on Cloud Run "
+                    f"the container holding it is discarded seconds from now.)"
                 ) from e
         finally:
             os.unlink(archive)

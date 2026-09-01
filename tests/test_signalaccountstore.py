@@ -518,3 +518,26 @@ def test_release_frees_the_lock_when_the_work_dir_vanished(tmp_path):
 
     assert LOCK in client.deletes
 
+
+def test_conflict_error_points_at_object_versioning(tmp_path):
+    """
+    The recovery route must be one that still exists when the error is read.
+    Naming the work dir alone pointed at /tmp inside a container Cloud Run
+    discards seconds later, and contradicted README's recovery section, which
+    documents `gsutil ls -a` against the versioned object.
+    """
+    client = FakeGcsClient()
+    seed_store(client, {"account.db": "x"})
+    store = GcsStore(gcs_config(tmp_path), client=client)
+    store.acquire()
+
+    # Another writer between our download and our upload.
+    client.generations[OBJECT] = 99
+
+    with pytest.raises(AccountStoreError) as exc:
+        store.release(None)
+
+    message = str(exc.value)
+
+    assert f"gsutil ls -a gs://test-bucket/{OBJECT}" in message
+    assert "version" in message
