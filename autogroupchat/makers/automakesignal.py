@@ -807,7 +807,16 @@ class AutoMakeSignal(AutoMakeGroupChat):
     def _add_members_individually(self,
                                   group: str,
                                   members: dict[str, str]) -> None:
-        """Add members one by one so one bad number cannot block the rest."""
+        """
+        Add members one by one so one bad number cannot block the rest.
+
+        Only a USER_ERROR (not-registered) rejection is tolerated per member,
+        matching the top-level dispatch in add_members_group. A transport
+        error means the infrastructure is broken, not the number: logging it
+        as a per-member failure and marching on to the next member would
+        mislabel the cause and hammer the same broken call once per remaining
+        member, for nothing.
+        """
         for name, number in members.items():
             if not number:
                 continue
@@ -815,6 +824,9 @@ class AutoMakeSignal(AutoMakeGroupChat):
             try:
                 self.cli.update_group(group, members=[number])
             except SignalCliError as e:
+                if e.exit_code != int(ExitCode.USER_ERROR):
+                    raise
+
                 logger.error(
                     f"could not add {name} ({number}) to {group}: "
                     f"{e.stderr.strip()}")
@@ -828,21 +840,57 @@ class AutoMakeSignal(AutoMakeGroupChat):
 
         return None
 
-    def _log_membership(self, group: str, members: dict[str, str]) -> None:
+    def _group_listing_or_none(self, group: str) -> dict[str, Any] | None:
+        """
+        group_by_id, tolerant of a failed re-read.
+
+        Used both to decide whether add_member_group can skip a number
+        already present, and to report status after an add. Either use sits
+        on top of an add that may have already succeeded, so a failure here
+        is logged and treated as "unknown" rather than raised -- it must
+        never sink the add it is checking or describing.
+        """
+        try:
+            return self.group_by_id(group)
+        except SignalCliError as e:
+            logger.warning(f"could not re-read group {group}: {e}")
+            return None
+
+    def _membership_sets(self,
+                         listing: dict[str, Any]) -> tuple[set[str], set[str]]:
+        """Split one listGroups entry into (joined numbers, pending numbers)."""
+        joined = {m.get("number") for m in listing.get("members") or []}
+        pending = {m.get("number") for m in listing.get("pendingMembers") or []}
+
+        return joined, pending
+
+    def _log_membership(self,
+                        group: str,
+                        members: dict[str, str],
+                        listing: dict[str, Any] | None = None) -> None:
         """
         Report who actually joined, who was only invited, and who is absent.
 
         Signal adds a member as *pending* when we do not hold their profile key;
         they must accept before they are really in the group. Without this the
         caller cannot tell a successful add from an ignored invitation.
+
+        `listing` lets a caller that already re-read the group (add_member_group's
+        idempotency check) reuse it instead of asking again. This runs after an
+        add that may have already succeeded, so a failed re-read is logged and
+        swallowed here too, not raised: a diagnostic must never sink the
+        operation it describes.
         """
-        listing = self.group_by_id(group)
         if listing is None:
-            logger.warning(f"group {group} did not appear in listGroups")
+            listing = self._group_listing_or_none(group)
+
+        if listing is None:
+            logger.warning(
+                f"could not confirm membership for group {group} "
+                f"(missing from listGroups, or the re-read failed)")
             return
 
-        joined = {m.get("number") for m in listing.get("members") or []}
-        pending = {m.get("number") for m in listing.get("pendingMembers") or []}
+        joined, pending = self._membership_sets(listing)
 
         for name, number in members.items():
             if number in joined:
@@ -862,14 +910,35 @@ class AutoMakeSignal(AutoMakeGroupChat):
                          name: str,
                          phone_number: str) -> None:
         """
-        Add a single member.
+        Add a single member, skipping when already present.
 
         Signature follows the ABC's *call site*, which passes the group first,
         rather than its declaration, which omits it. See spec section 15.
+
+        signal-cli does not document what updateGroup -m does for a number
+        already in the group, and group_startup adds the admin after the
+        member batch -- so rather than find out, the group is re-read first
+        and the add is skipped outright when the number is already joined or
+        pending. That same read doubles as this call's status report when it
+        skips; when it does add, the pre-add read cannot reflect the post-add
+        state, so a fresh read follows instead -- reported exactly like
+        add_members_group does, since a profile-key-less admin still lands
+        pending, and an unconditional "added" here would hide that from the
+        change_group_owner call that follows.
         """
+        listing = self._group_listing_or_none(group)
+        if listing is not None:
+            joined, pending = self._membership_sets(listing)
+            if phone_number in joined or phone_number in pending:
+                logger.info(
+                    f"{name} ({phone_number}) is already in {group}; "
+                    f"skipping the add")
+                self._log_membership(group, {name: phone_number}, listing=listing)
+                return
+
         self.cli.update_group(group, members=[phone_number])
 
-        logger.info(f"added {name} ({phone_number}) to {group}")
+        self._log_membership(group, {name: phone_number})
 
     def change_group_owner(self,
                            group: str,

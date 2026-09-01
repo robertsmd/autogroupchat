@@ -299,10 +299,121 @@ def test_add_members_logs_the_pending_split(config_file, caplog):
     assert "pending" in logged.lower()
 
 
+def test_add_members_individually_reraises_on_transport_error(config_file):
+    """
+    Review finding (Important 1): the per-member fallback must not swallow a
+    transport error the way it swallows a not-registered rejection. Without
+    the exit-code check, a SERVER_OR_IO failure (already retried and
+    exhausted inside SignalCli) reads as "this number is bad" and the loop
+    marches on to hammer the same broken infrastructure for every remaining
+    member, burning the invocation budget for nothing.
+    """
+    members = {
+        "Alice": "+15551112222",
+        "Bob": "+15553334444",
+        "Carol": "+15556667777",
+    }
+    runner = FakeRunner()
+    runner.queue(
+        int(ExitCode.USER_ERROR), "", "The user +15553334444 is not registered.")
+    runner.queue(0, "{}")  # Alice's individual add succeeds
+    for _ in range(len(BACKOFF_SERVER_OR_IO) + 1):
+        runner.queue(int(ExitCode.SERVER_OR_IO), "", "server sad")  # Bob's calls
+
+    maker = make_maker(config_file, runner)
+
+    with pytest.raises(SignalCliError) as excinfo:
+        with maker.session():
+            maker.add_members_group("gid", members)
+
+    assert excinfo.value.exit_code == int(ExitCode.SERVER_OR_IO)
+    # 1 batch call + 1 for Alice + Bob's exhausted retries. Carol's turn must
+    # never come: the loop has to stop at Bob, not log-and-continue past his
+    # transport error.
+    assert len(runner.calls) == 1 + 1 + (len(BACKOFF_SERVER_OR_IO) + 1)
+
+
+def test_add_members_tolerates_a_failing_membership_reread(config_file, caplog):
+    """
+    Review finding (Important 2): a failed post-add re-read is a diagnostic
+    describing an add that already succeeded, and must not sink it. Without
+    a guard, list_groups raising here escapes add_members_group even though
+    both members were just added -- and the caller never reaches
+    change_group_owner or send_message_to_group.
+    """
+    runner = FakeRunner()
+    runner.queue(0, "{}")  # the batched updateGroup succeeds
+    runner.queue(int(ExitCode.UNEXPECTED), "", "listGroups exploded")
+
+    maker = make_maker(config_file, runner)
+
+    with caplog.at_level("WARNING"):
+        with maker.session():
+            maker.add_members_group("gid", MEMBERS)  # must not raise
+
+    assert "gid" in caplog.text
+
+
+def test_add_member_group_logs_pending_not_added(config_file, caplog):
+    """
+    Review finding (Important 3): without a re-read, a member who lands in
+    pendingMembers (profile key unknown) was logged as unconditionally
+    "added" -- an actively wrong claim, not mere silence. group_startup adds
+    the admin through this path, so a wrongly-"added" admin could be
+    followed by a change_group_owner call against someone who never joined.
+    """
+    runner = FakeRunner()
+    runner.queue(0, group_listing())  # pre-add: Alice is not there yet
+    runner.queue(0, "{}")  # updateGroup succeeds
+    runner.queue(0, group_listing(
+        pendingMembers=[{"number": "+15551112222", "uuid": "uuid-alice"}]))
+
+    maker = make_maker(config_file, runner)
+
+    with caplog.at_level("INFO"):
+        with maker.session():
+            maker.add_member_group("gid", "Alice", "+15551112222")
+
+    logged = caplog.text.lower()
+    assert "pending" in logged
+    assert "added" not in logged
+
+
+def test_add_member_group_skips_an_already_present_number(config_file, caplog):
+    """
+    Review finding (Also): rather than rely on undocumented updateGroup
+    behaviour for a number already in the group, skip the call outright.
+    group_startup adds the admin after the member batch, so a re-add of the
+    same number is not a hypothetical.
+    """
+    runner = FakeRunner()
+    runner.queue(0, group_listing(
+        members=[
+            {"number": "+15551234567", "uuid": "uuid-self", "isAdmin": True},
+            {"number": "+15551112222", "uuid": "uuid-alice", "isAdmin": False},
+        ],
+    ))
+
+    maker = make_maker(config_file, runner)
+
+    with caplog.at_level("INFO"):
+        with maker.session():
+            maker.add_member_group("gid", "Alice", "+15551112222")
+
+    assert len(runner.calls) == 1
+    assert "listGroups" in runner.calls[0]
+    assert "skip" in caplog.text.lower()
+
+
 def test_add_member_group_takes_the_group_first(config_file):
     """
     The ABC calls this as add_member_group(group, name, number) while declaring
     (self, name, phone_number). The call site wins; see spec section 15.
+
+    add_member_group now re-reads the group before and after the add (see the
+    idempotency and pending-status regression tests below), so the updateGroup
+    call is no longer necessarily runner.last -- it is located by content
+    instead.
     """
     runner = FakeRunner().queue(0, "{}")
     maker = make_maker(config_file, runner)
@@ -310,7 +421,7 @@ def test_add_member_group_takes_the_group_first(config_file):
     with maker.session():
         maker.add_member_group("gid", "Alice", "+15551112222")
 
-    argv = runner.last
+    argv = next(c for c in runner.calls if "updateGroup" in c)
     assert argv[argv.index("-g") + 1] == "gid"
     assert argv[argv.index("-m") + 1] == "+15551112222"
 
