@@ -104,124 +104,272 @@ Found while building the Signal maker. Not fixed, per scope; recorded so they ar
 
 ## Cloud deployment
 
-### Google Cloud deployment
+Both makers deploy to Google Cloud on the same trigger chain. Google renamed Cloud Functions 2nd gen to *Cloud Run functions*; 1st gen is legacy.
 
-Cloud deployment was initially done based on this tutorial: https://towardsdatascience.com/how-to-schedule-a-python-script-on-google-cloud-721e331a9590. Reference this tutorial if setting up autogroupchat for the first time.
-
-The tutorial goes through these rough steps:
-1. Enable Google Cloud Platform (GCP)
-2. Schedule a job with Google Cloud Scheduler
-
-    2.1. Timing: schedule the job for daily at 7am using the cron line `0 7 * * *`or every sunday at 7am using the cron line `0 7 * * SUN`.
-    
-    2.2. Target: Pub/Sub. The topic prefix will be set based on the project, the sub-topic should be `test` or `prod` or something else based on your use case.
-    
-    2.3. Advanced: optional retry settings
-
-3. Create a Google Cloud Function
-    
-    3.1. Tab 1 - Trigger: Pub/Sub. The topic should be the same as in 2.2.
-    
-    3.2. Tab 2 - Runtime: Pick the most recent Python version. Built initially using 3.10
-    
-    3.3. Tab 2 - main.py: Copy all of [google_cloud_main.py](/google_cloud_main.py) into `main.py`
-    
-    3.4. Tab 2 - requirements.txt: Copy all of [requirements.txt](/requirements.txt) into `requirements.txt`
-    
-    3.5. Tab 2 - configs: copy all the config files from [configs_templates](/configs_templates) folder into [configs](/configs). Make sure there are no stubbed `<>` tags in the config files-- populate them with real data.
-    
-    3.6. Tab 3 - configs: copy the files from the [configs](/configs) folder into the Cloud Function at the same level as `main.py`. (for google sheets --> groupme, your project should look like the screenshot below and should include configs: [config_googlesheets_groupme.json](/config_googlesheets_groupme.json), [config_googleapi_token.json.json](/config_googleapi_token.json.json), [config_googleapi.json](config_googleapi.json), and [config_groupme.json](config_groupme.json))
-
-    ![Google Cloud Function source](/assets/images/google/google_cloud_function_source.png)
-
-4. Setup an alert if there are errors
-
-    4.1. Go to the `Logs` tab in the Google Cloud Functiono created above
-    
-    4.2. Click `View in Log Explorer`
-    
-    4.3. In log explorer, click `Create Alert`
-    
-        4.3.1. Pick a name for the alert message
-        
-        4.3.2. Choose logs to include in the alert (to alert on). (Recommend: `severity="ERROR"`)
-        
-        4.3.3. Set Notification Frequency and Autoclose Duration. Notification frequency is how often to send an alert if they are constantly erroring, Autoclose duration is when to automatically resolve the notification. 
-        
-        4.3.4. Set who should be notified. You can go into `Manage Notification Channels` to add a way to notify yourself.
-        
-        
-    4.4. To manage later, go to https://console.cloud.google.com/monitoring/alerting/policies
-
-### Google Cloud deployment (Signal, 2nd gen)
-
-The Signal maker cannot deploy as a 1st-gen Cloud Function like the GroupMe path above. It needs a 2nd-gen Cloud Run service, built from a container image.
-
-**Why 2nd gen is required.**
-
-- signal-cli's native (GraalVM, no-JRE) build is one static file: 372,377,528 bytes uncompressed, 110 MB gzipped, pinned by sha256 in `deploy/signal/Dockerfile`. Cloud Functions 1st gen caps source at 100 MB *compressed* (500 MB uncompressed). The compressed limit binds here, and the artifact ships as gzip already, so no repackaging helps -- 1st gen is impossible regardless of the uncompressed figure.
-- The account store signal-cli keeps is WAL-mode SQLite. WAL needs shared-memory locking that GCSFuse does not provide; mounting the data dir from GCS risks a corrupted identity store. The store must run on a real local filesystem and move to and from GCS as an opaque tarball, never as a mounted volume.
-
-The built image itself is 949 MB uncompressed on disk (governs Cloud Run's image cache and local disk footprint) and about 217 MB gzipped over the wire (governs registry push/pull and cold-start pull time). Both numbers are separate from the 1st-gen limit above, which is a *source* size limit, not an image size limit -- 1st gen is ruled out on that basis alone, independent of how big the image ends up.
-
-**1. The GCS state bucket**, with versioning on, so a bad upload still leaves the previous snapshot recoverable:
-
-```bash
-gsutil mb -b on gs://<state_bucket_name>
-gsutil versioning set on gs://<state_bucket_name>
+```
+Cloud Scheduler ──07:00──▶ Pub/Sub topic ──▶ Eventarc trigger ──▶ Cloud Run
+ (cron + time zone)        (autogroupchat)     (push, ack 600 s)    ├─ GroupMe: function, built from source
+                                                                    └─ Signal: prebuilt container image
 ```
 
-**Lock this bucket down before anything lands in it.** The object it holds is the account's identity private key and ratchet state, not a token -- **read access to it is full control of the Signal account**, and there is nothing to rotate afterwards. Grant `roles/storage.objectAdmin` to the deploying service account alone, scoped to the `signal-cli/` prefix with an IAM condition (the store object and its lock must be read, written and overwritten); if a prefix condition is more trouble than it is worth, use a dedicated bucket for this and nothing else. Remove `projectEditor`/`projectViewer` legacy access, and grant no human user read on it.
+Signal cannot be a source-built function: signal-cli's native build is 110 MB gzipped, and it needs a stateful account store (see [Signal](#google-cloud-deployment-signal)). It runs as a Cloud Run *service* from an image instead. Same console, same free tier.
 
-**2. Build, push and deploy:**
+Commands below were checked against Google's docs on 2026-09-26 but **not executed** -- `gcloud` was unavailable where this was written. Run each step's check before moving on.
 
-```bash
-docker build -f deploy/signal/Dockerfile -t <region>-docker.pkg.dev/<project>/<repo>/autogroupchat-signal:v1 .
-docker push <region>-docker.pkg.dev/<project>/<repo>/autogroupchat-signal:v1
+### Cost
 
-gcloud run deploy autogroupchat-signal \
-  --image <region>-docker.pkg.dev/<project>/<repo>/autogroupchat-signal:v1 \
-  --region <region> \
-  --no-allow-unauthenticated \
-  --max-instances 1 \
-  --concurrency 1 \
-  --timeout 540 \
-  --memory 1Gi
-```
+One run a day fits the Always Free tier. Worst case, 30 runs x 540 s:
 
-- `--max-instances 1` and `--concurrency 1` are **correctness requirements, not tuning**. Two invocations running against the same account store at once will corrupt it -- nothing else in this design enforces mutual exclusion at that scale.
-- `--timeout 540` is the Cloud Run 2nd-gen event-driven ceiling. The config's `invocation_budget_seconds` defaults to 480 (540 minus 60 s reserved for downloading and uploading the store), so the maker fails cleanly inside its own budget instead of being killed mid-write by the platform.
-- `--memory 1Gi` is **provisional**, not derived. `/tmp` is tmpfs, so the extracted account store counts against memory. Run `doctor` (above) once the account is linked, and set `--memory` from what it reports the store weighs plus headroom -- do not deploy on this guess alone.
+| Resource | Monthly use | Free | Share |
+|---|---|---|---|
+| Cloud Run vCPU | 30 x 540 s x 1 vCPU = 16,200 vCPU-s | 180,000 | 9% |
+| Cloud Run memory | 30 x 540 s x 1 GiB = 16,200 GiB-s | 360,000 | 4.5% |
+| Artifact Registry | ~217 MB per Signal image version | 0.5 GB | 43% per version |
+| Cloud Storage | store size x versions kept | 5 GB-months, US regions only | depends |
+| Secret Manager | 3 active versions (Signal) | 6 versions, 10,000 reads | 50% |
 
-**3. Supplying the runtime config.** The image deliberately contains no `configs/` -- the `COPY` list in `deploy/signal/Dockerfile` names `autogroupchat`, `setup.py` and `main.py` only, which is what actually keeps credentials out of every layer. Nothing here fixes itself by adding `COPY configs`: `config_googleapi.json` is a Google service-account key, and baking it into an image layer puts it wherever pull access reaches. But `main.py` still needs, at invocation time:
+Three things can leave the free tier, each guarded in the steps below: old image versions (cleanup policy), one noncurrent store version per day (lifecycle rule), and stale secret versions (destroy them after an update). Use a US region such as `us-central1` for the storage tier.
 
-- the top-level scraper config named by `$AUTOGROUPCHAT_CONFIG` (default `configs/config_googlesheets_signal.json`)
-- the two paths read out of *that* file's own contents -- `api_config` (`configs/config_googleapi.json`) and `group_creation_config` (`configs/config_signal.json`)
+### Shared setup (once per project)
 
-`AUTOGROUPCHAT_CONFIG` only relocates the first file. The other two are opened by the relative path written inside it, resolved against the container's working directory (`/app`) -- so they must still land at `/app/configs/` unless the operator's own top-level config is edited to use absolute paths instead.
+Skip steps 4-5 if you are migrating and the topic and Scheduler job already exist.
 
-Mount all three as files via Cloud Run's Secret Manager secret-volume support, not `--set-env-vars` and not a baked-in `COPY`. The shape is roughly the flag below, added to the `gcloud run deploy` call above -- **unverified**: `gcloud` is not available in this environment, so this was not run, and the exact flag syntax must be checked against the current Cloud Run docs before use:
+1. Install the [gcloud CLI](https://cloud.google.com/sdk/docs/install), then:
 
-```bash
-# UNVERIFIED -- shape only, not run. Check `gcloud run deploy --help` /
-# current Cloud Run docs for the exact secret-volume flag syntax.
---set-secrets=/app/configs/config_googlesheets_signal.json=googlesheets-signal-config:latest,/app/configs/config_googleapi.json=googleapi-sa-key:latest,/app/configs/config_signal.json=signal-config:latest
-```
+    ```bash
+    gcloud auth login
+    gcloud config set project <project>
+    PROJECT=<project>
+    REGION=us-central1
+    SA=autogroupchat@${PROJECT}.iam.gserviceaccount.com
+    ```
 
-**4. The Eventarc trigger**, on the existing Cloud Scheduler Pub/Sub topic: point its destination at the new `autogroupchat-signal` Cloud Run service instead of the GroupMe Cloud Function. Nothing about the schedule or the topic changes from the GroupMe setup described above.
+2. Enable the APIs:
 
-functions-framework is started with `--signature-type=event` (see the `CMD` in `deploy/signal/Dockerfile`), which adapts Eventarc's CloudEvent payload into the legacy `autogroupchat_pubsub(event, context)` handler unchanged -- confirmed by running the built container and observing the adapted call reach the handler.
+    ```bash
+    gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+      artifactregistry.googleapis.com eventarc.googleapis.com pubsub.googleapis.com \
+      cloudscheduler.googleapis.com secretmanager.googleapis.com storage.googleapis.com \
+      sheets.googleapis.com drive.googleapis.com
+    ```
 
-**5. Uploading the linked store, once**, after running `link` locally -- the account cannot be linked from inside the container; linking needs a human scanning a QR code:
+3. Create the runtime service account. It runs the service and authenticates the trigger. It is **not** what reads the spreadsheet -- that is the key in `config_googleapi.json` (see [Google Sheets](#google-sheets)).
 
-```bash
-umask 077   # the tarball below contains the account's identity private key
-tar -czf store.tar.gz -C <local_data_dir> .
-gsutil cp store.tar.gz gs://<state_bucket_name>/signal-cli/<+15551234567>.tar.gz
-shred -u store.tar.gz   # or `rm -P` / `rm`; do not leave it in your CWD
-```
+    ```bash
+    gcloud iam service-accounts create autogroupchat
+    ```
 
-After this, every deployed invocation just serves; the account is not re-linked again unless the store is lost (below).
+4. Create the topic:
+
+    ```bash
+    gcloud pubsub topics create autogroupchat
+    ```
+
+5. Create the daily job. `--time-zone` defaults to UTC; set yours.
+
+    ```bash
+    gcloud scheduler jobs create pubsub autogroupchat-daily \
+      --location=$REGION --schedule="0 7 * * *" --time-zone="America/New_York" \
+      --topic=autogroupchat --message-body="run"
+    ```
+
+    Weekly instead: `--schedule="0 7 * * SUN"`. A job name cannot be reused, even after deletion.
+
+### Google Cloud deployment (GroupMe)
+
+1. **Configs.** Populate `configs/config_googlesheets_groupme.json`, `configs/config_googleapi.json` and `configs/config_groupme.json`. Start from a working config, not `configs_templates/config_googlesheets_groupme.json` -- that template is stale (Known issue 3). Paths inside it must carry the `configs/` prefix.
+
+2. **Stage the source.** `gcloud run deploy --source` honours `.gitignore`, which excludes `configs/*`; deploying from the repo root would ship without configs. Stage a clean directory:
+
+    ```bash
+    STAGE=$(mktemp -d)
+    cp google_cloud_main.py "$STAGE/main.py"
+    cp requirements.txt "$STAGE/"
+    rsync -a --exclude __pycache__ autogroupchat configs "$STAGE/"
+    ```
+
+    The configs travel inside the source upload and the built image, as they did on 1st gen. Anyone with read on the project's `run-sources-*` bucket or its Artifact Registry repo can read the GroupMe token and the Sheets key.
+
+3. **Deploy.** `google_cloud_main.py` uses the legacy `(event, context)` signature. `GOOGLE_FUNCTION_SIGNATURE_TYPE=event` tells the buildpack to keep it, as the Signal image does with `--signature-type=event`. This combination is not documented end to end by Google; step 6 is the check.
+
+    ```bash
+    gcloud run deploy autogroupchat-groupme \
+      --source "$STAGE" --function autogroupchat_pubsub --base-image python314 \
+      --set-build-env-vars GOOGLE_FUNCTION_SIGNATURE_TYPE=event \
+      --region $REGION --service-account $SA --no-allow-unauthenticated \
+      --max-instances 1 --timeout 540
+    rm -rf "$STAGE"
+    ```
+
+    `--max-instances 1`: two overlapping runs would create every group twice. `--timeout 540` stays below the 600 s ack deadline set in step 5.
+
+4. **Let the trigger invoke it.**
+
+    ```bash
+    gcloud run services add-iam-policy-binding autogroupchat-groupme \
+      --region $REGION --member=serviceAccount:$SA --role=roles/run.invoker
+    ```
+
+    Without this the trigger reports healthy but every delivery fails as unauthenticated.
+
+5. **Create the trigger**, then raise its ack deadline:
+
+    ```bash
+    gcloud eventarc triggers create autogroupchat-groupme \
+      --location=$REGION \
+      --destination-run-service=autogroupchat-groupme --destination-run-region=$REGION \
+      --event-filters="type=google.cloud.pubsub.topic.v1.messagePublished" \
+      --transport-topic=projects/$PROJECT/topics/autogroupchat \
+      --service-account=$SA --max-retry-attempts=1
+
+    SUB=$(gcloud eventarc triggers describe autogroupchat-groupme --location=$REGION \
+      --format='value(transport.pubsub.subscription)')
+    gcloud pubsub subscriptions update "$SUB" --ack-deadline=600
+    ```
+
+    - Ack deadline: Eventarc defaults to 10 s. A run longer than that is redelivered and runs again -- duplicate groups. 600 s is Pub/Sub's maximum and exceeds `--timeout 540`.
+    - `--max-retry-attempts=1`: no retry after a failure, matching 1st gen's default. A retried run would re-create the groups that succeeded.
+    - If the Pub/Sub service agent in your project predates 2021-04-08, also grant `service-<project_number>@gcp-sa-pubsub.iam.gserviceaccount.com` `roles/iam.serviceAccountTokenCreator`.
+
+6. **Test.** `gcloud pubsub topics publish autogroupchat --message=test`, then read the service's logs (Console > Cloud Run > `autogroupchat-groupme` > Logs). A `TypeError` about handler arguments means the signature setting in step 3 did not take; switch the handler to the `@functions_framework.cloud_event` form.
+
+7. **Alert on errors.** Console > Logging > Logs Explorer, query `resource.labels.service_name="autogroupchat-groupme" severity>=ERROR`, then *Create alert*: pick a notification frequency, an autoclose duration and a channel (*Manage notification channels* to add email). Manage later at https://console.cloud.google.com/monitoring/alerting/policies.
+
+8. **Retire the 1st gen function** once a scheduled run succeeds. `python310` -- the runtime it was built on -- is deprecated on 2026-10-04.
+
+    ```bash
+    gcloud functions delete <old_function_name> --region=<old_region>
+    ```
+
+    Alternative for an existing function: Google's in-place 1st gen upgrade tool (GA 2026-08-10), which keeps the name, code and configuration.
+
+### Google Cloud deployment (Signal)
+
+**Why not a function.**
+
+- signal-cli's native (GraalVM, no-JRE) build is one static file: 372,377,528 bytes uncompressed, 110 MB gzipped, pinned by sha256 in `deploy/signal/Dockerfile`. Cloud Functions 1st gen caps source at 100 MB *compressed*; the artifact ships gzipped already, so no repackaging helps. The image (949 MB on disk, ~217 MB gzipped) is not subject to that limit.
+- The account store signal-cli keeps is WAL-mode SQLite. WAL needs shared-memory locking that GCSFuse does not provide; mounting the data dir from GCS risks a corrupted identity store. The store runs on the container's local filesystem and moves to and from GCS as an opaque tarball.
+
+1. **Artifact Registry repo**, with a cleanup policy keeping the two newest image versions (2 x 217 MB fits the 0.5 GB free tier; a third does not):
+
+    ```bash
+    gcloud artifacts repositories create autogroupchat --repository-format=docker --location=$REGION
+
+    cat > policy.json <<'EOF'
+    [
+      {"name": "keep-2", "action": {"type": "Keep"}, "mostRecentVersions": {"keepCount": 2}},
+      {"name": "delete-old", "action": {"type": "Delete"}, "condition": {"tagState": "any", "olderThan": "30d"}}
+    ]
+    EOF
+    gcloud artifacts repositories set-cleanup-policies autogroupchat --location=$REGION --policy=policy.json --dry-run
+    gcloud artifacts repositories set-cleanup-policies autogroupchat --location=$REGION --policy=policy.json --no-dry-run
+    ```
+
+    A Keep rule alone deletes nothing; it only exempts versions from the Delete rule. Policies take effect within about a day.
+
+2. **Build and push.** `--platform linux/amd64` is required on Apple Silicon: the Dockerfile fetches the x86-64 signal-cli and Cloud Run runs amd64.
+
+    ```bash
+    IMAGE=$REGION-docker.pkg.dev/$PROJECT/autogroupchat/autogroupchat-signal:v1
+    gcloud auth configure-docker $REGION-docker.pkg.dev
+    docker build --platform linux/amd64 -f deploy/signal/Dockerfile -t $IMAGE .
+    docker push $IMAGE
+    ```
+
+3. **State bucket**: dedicated, versioned, noncurrent versions deleted after 30 days. Every run uploads the store, so versioning adds one noncurrent version per day; the lifecycle rule caps storage at about 30 x the store size (`doctor` reports it).
+
+    ```bash
+    BUCKET=<state_bucket_name>
+    gcloud storage buckets create gs://$BUCKET --location=$REGION --uniform-bucket-level-access
+    gcloud storage buckets update gs://$BUCKET --versioning
+
+    cat > lc.json <<'EOF'
+    {"lifecycle": {"rule": [{"action": {"type": "Delete"}, "condition": {"daysSinceNoncurrentTime": 30}}]}}
+    EOF
+    gcloud storage buckets update gs://$BUCKET --lifecycle-file=lc.json
+
+    gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
+      --member=serviceAccount:$SA --role=roles/storage.objectAdmin
+    ```
+
+    **Lock this bucket down before anything lands in it.** The object it holds is the account's identity private key and ratchet state, not a token -- **read access to it is full control of the Signal account**, and there is nothing to rotate afterwards. The service account needs `objectAdmin` (the store object and its lock are read, written and overwritten). Use this bucket for nothing else, and grant no human user read on it.
+
+4. **Link and upload the store, once.** Linking needs a human scanning a QR code, so it runs locally (steps in [Signal](#signal)), never in the container:
+
+    ```bash
+    python -m autogroupchat.makers.automakesignal -g configs/config_signal.json link --name autogroupchat
+    python -m autogroupchat.makers.automakesignal -g configs/config_signal.json doctor
+
+    umask 077   # the tarball contains the account's identity private key
+    tar -czf store.tar.gz -C <local_data_dir> .
+    gcloud storage cp store.tar.gz gs://$BUCKET/signal-cli/<+15551234567>.tar.gz
+    shred -u store.tar.gz   # or `rm -P` / `rm`; do not leave it in your CWD
+    ```
+
+5. **Configs as secrets.** The image contains no `configs/` -- the `COPY` list in `deploy/signal/Dockerfile` never names it, which keeps the Sheets key out of every layer. Cloud Run mounts each secret in its own directory: it cannot put two secrets in one directory, and a mount hides whatever the directory held. So each file gets its own path:
+
+    | Secret | Mounted at | Source |
+    |---|---|---|
+    | `signal-scraper-config` | `/secrets/scraper/config.json` | `configs_templates/config_googlesheets_signal.json` |
+    | `googleapi-sa-key` | `/secrets/googleapi/config_googleapi.json` | your Sheets service-account key |
+    | `signal-config` | `/secrets/signal/config_signal.json` | `configs_templates/config_signal_gcs.json` |
+
+    The scraper config opens the other two by the paths written inside it, so those must be absolute:
+
+    ```json
+    "api_config": "/secrets/googleapi/config_googleapi.json",
+    "group_creation_config": "/secrets/signal/config_signal.json"
+    ```
+
+    Then:
+
+    ```bash
+    gcloud secrets create signal-scraper-config --data-file=<scraper_config.json>
+    gcloud secrets create googleapi-sa-key --data-file=<config_googleapi.json>
+    gcloud secrets create signal-config --data-file=<config_signal_gcs.json>
+    for s in signal-scraper-config googleapi-sa-key signal-config; do
+      gcloud secrets add-iam-policy-binding $s \
+        --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor
+    done
+    ```
+
+    Do not pass `--location`: Cloud Run does not support regional secrets. To change one later, `gcloud secrets versions add <name> --data-file=...`, then `gcloud secrets versions destroy <old_version> --secret=<name>` -- only 6 active versions are free.
+
+6. **Deploy:**
+
+    ```bash
+    gcloud run deploy autogroupchat-signal \
+      --image $IMAGE --region $REGION --service-account $SA --no-allow-unauthenticated \
+      --max-instances 1 --concurrency 1 --timeout 540 --memory 1Gi \
+      --set-env-vars AUTOGROUPCHAT_CONFIG=/secrets/scraper/config.json \
+      --set-secrets=/secrets/scraper/config.json=signal-scraper-config:latest,/secrets/googleapi/config_googleapi.json=googleapi-sa-key:latest,/secrets/signal/config_signal.json=signal-config:latest
+    ```
+
+    - `--max-instances 1` and `--concurrency 1` are **correctness requirements, not tuning**. Two invocations against one account store will corrupt it.
+    - `--timeout 540`: `invocation_budget_seconds` defaults to 480 (540 minus 60 s for moving the store), so the maker fails inside its own budget instead of being killed mid-write. 540 also stays below the 600 s ack deadline (step 7).
+    - `--memory 1Gi` is **provisional**, not derived. `/tmp` is tmpfs, so the extracted store counts against memory. Set it from what `doctor` reports the store weighs, plus headroom.
+
+7. **Trigger.** Same as GroupMe steps 4-5, with `autogroupchat-signal` for the service and trigger names:
+
+    ```bash
+    gcloud run services add-iam-policy-binding autogroupchat-signal \
+      --region $REGION --member=serviceAccount:$SA --role=roles/run.invoker
+
+    gcloud eventarc triggers create autogroupchat-signal \
+      --location=$REGION \
+      --destination-run-service=autogroupchat-signal --destination-run-region=$REGION \
+      --event-filters="type=google.cloud.pubsub.topic.v1.messagePublished" \
+      --transport-topic=projects/$PROJECT/topics/autogroupchat \
+      --service-account=$SA --max-retry-attempts=1
+
+    SUB=$(gcloud eventarc triggers describe autogroupchat-signal --location=$REGION \
+      --format='value(transport.pubsub.subscription)')
+    gcloud pubsub subscriptions update "$SUB" --ack-deadline=600
+    ```
+
+    The ack deadline matters more here: a redelivery during a run hits `--max-instances 1`, is rejected, and is retried until it runs a second time after the first finishes. If GroupMe is retired, delete its trigger (`gcloud eventarc triggers delete autogroupchat-groupme --location=$REGION`) or both makers will fire on the same topic.
+
+8. **Test** with `gcloud pubsub topics publish autogroupchat --message=test` and read the service's logs. functions-framework adapts Eventarc's CloudEvent into the legacy `autogroupchat_pubsub(event, context)` handler -- confirmed by running the built container locally. Add an error alert as in GroupMe step 7, with `service_name="autogroupchat-signal"`.
 
 #### Recovering a desynchronised Signal account
 
@@ -231,8 +379,8 @@ After this, every deployed invocation just serves; the account is not re-linked 
 
 Recovery is manual:
 
-1. Check whether the bucket holds a newer object version than the one in use: `gsutil ls -a gs://<state_bucket_name>/signal-cli/<+15551234567>.tar.gz`.
-2. If there is no newer version, re-link the device with the same config -- this replaces the store: `python -m autogroupchat.makers.automakesignal -g configs/config_signal.json link --name autogroupchat`.
+1. Check whether the bucket holds a newer object version than the one in use: `gcloud storage ls --all-versions gs://<state_bucket_name>/signal-cli/<+15551234567>.tar.gz`.
+2. If there is no newer version, re-link the device with the same config -- this replaces the store: `python -m autogroupchat.makers.automakesignal -g configs/config_signal.json link --name autogroupchat`. Then upload it as in Signal step 4.
 3. Re-linking changes nothing about group membership. Groups persist server-side; only this device's local ratchet state is reset.
 
 ## Resources
