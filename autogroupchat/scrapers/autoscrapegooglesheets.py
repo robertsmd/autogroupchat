@@ -10,6 +10,7 @@ import gspread
 
 from autogroupchat.makers.automakegroupchat import AutoMakeGroupChat
 from autogroupchat.makers.automakegroupme import AutoMakeGroupMe
+from autogroupchat.makers.automakesignal import AutoMakeSignal
 from autogroupchat.scrapers.autoscrapegroup import AutoScrapeGroup
 
 # requires spreadsheets and drive scopes

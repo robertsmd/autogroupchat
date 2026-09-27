@@ -1,0 +1,10 @@
+{
+    "signal_number": "<+15551234567>",
+    "signal_cli_path": "signal-cli",
+    "account_store": {
+        "type": "local",
+        "data_dir": "~/.local/share/signal-cli"
+    },
+    "trust_new_identities": "on-first-use",
+    "invocation_budget_seconds": 480
+}

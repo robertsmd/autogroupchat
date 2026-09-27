@@ -1,0 +1,13 @@
+{
+    "verbose": false,
+    "api_config": "configs/config_googleapi.json",
+    "spreadsheet": "<spreadsheet_name_or_uuid>",
+    "worksheet": "Sheet1",
+    "range": "",
+    "scopes": [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly"
+    ],
+    "group_creation_class": "AutoMakeSignal",
+    "group_creation_config": "configs/config_signal.json"
+}
